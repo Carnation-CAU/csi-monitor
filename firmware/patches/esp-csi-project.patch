@@ -1,0 +1,330 @@
+diff --git a/examples/esp-radar/console_test/main/app_main.c b/examples/esp-radar/console_test/main/app_main.c
+index 23e76c7..94c668e 100644
+--- a/examples/esp-radar/console_test/main/app_main.c
++++ b/examples/esp-radar/console_test/main/app_main.c
+@@ -20,6 +20,7 @@
+
+ #include "esp_mac.h"
+ #include "esp_wifi.h"
++#include "esp_now.h"
+ #include "lwip/inet.h"
+ #include "lwip/netdb.h"
+ #include "lwip/sockets.h"
+@@ -32,8 +33,13 @@
+ #include "csi_commands.h"
+
+ #define RECV_ESPNOW_CSI
+-#define CONFIG_LESS_INTERFERENCE_CHANNEL    11
++#define CONFIG_LESS_INTERFERENCE_CHANNEL    6
+ #define CONFIG_SEND_DATA_FREQUENCY          100
++#define RF_CONTROL_MAGIC                    0x43534952
++#define RF_CONTROL_VERSION                  1
++#define RF_SWITCH_REPEAT_COUNT              8
++#define RF_SWITCH_REPEAT_INTERVAL_MS        20
++#define RF_SWITCH_DELAY_MS                  500
+
+ #define RADAR_EVALUATE_SERVER_PORT          3232
+ #define RADAR_BUFF_MAX_LEN                  25
+@@ -42,6 +48,18 @@ static QueueHandle_t g_csi_info_queue    = NULL;
+ static bool g_wifi_connect_status        = false;
+ static uint32_t g_send_data_interval     = 1000 / CONFIG_SEND_DATA_FREQUENCY;
+ static const char *TAG                   = "app_main";
++static const uint8_t BROADCAST_MAC[]     = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
++
++typedef struct __attribute__((packed)) {
++    uint32_t magic;
++    uint8_t version;
++    uint8_t channel;
++} rf_control_packet_t;
++
++static wifi_second_chan_t get_secondary_channel(uint8_t channel)
++{
++    return channel == 11 ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
++}
+
+ static void wifi_init(void)
+ {
+@@ -66,13 +84,85 @@ static void wifi_init(void)
+     esp_netif_create_default_wifi_sta();
+     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+     ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G));
+-    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
++    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
++                                         get_secondary_channel(CONFIG_LESS_INTERFERENCE_CHANNEL)));
+
+ #ifdef RECV_ESPNOW_CSI 
+     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
+ #endif
+ }
+
++static void espnow_init(void)
++{
++    ESP_ERROR_CHECK(esp_now_init());
++    ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
++
++    esp_now_peer_info_t peer = {
++        .channel   = 0,
++        .ifidx     = WIFI_IF_STA,
++        .encrypt   = false,
++        .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
++    };
++    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
++}
++
++static struct {
++    struct arg_int *set;
++    struct arg_end *end;
++} rf_channel_args;
++
++static int rf_channel_cmd(int argc, char **argv)
++{
++    if (arg_parse(argc, argv, (void **)&rf_channel_args) != ESP_OK) {
++        arg_print_errors(stderr, rf_channel_args.end, argv[0]);
++        return ESP_FAIL;
++    }
++
++    if (!rf_channel_args.set->count) {
++        uint8_t primary = 0;
++        wifi_second_chan_t secondary = WIFI_SECOND_CHAN_NONE;
++        ESP_ERROR_CHECK(esp_wifi_get_channel(&primary, &secondary));
++        printf("RF_CHANNEL,%u\n", primary);
++        return ESP_OK;
++    }
++
++    uint8_t channel = rf_channel_args.set->ival[0];
++    if (channel != 1 && channel != 6 && channel != 11) {
++        printf("RF_CHANNEL_ERROR,allowed=1|6|11\n");
++        return ESP_ERR_INVALID_ARG;
++    }
++
++    rf_control_packet_t packet = {
++        .magic = RF_CONTROL_MAGIC,
++        .version = RF_CONTROL_VERSION,
++        .channel = channel,
++    };
++    for (int i = 0; i < RF_SWITCH_REPEAT_COUNT; ++i) {
++        ESP_ERROR_CHECK(esp_now_send(BROADCAST_MAC, (uint8_t *)&packet, sizeof(packet)));
++        vTaskDelay(pdMS_TO_TICKS(RF_SWITCH_REPEAT_INTERVAL_MS));
++    }
++
++    vTaskDelay(pdMS_TO_TICKS(RF_SWITCH_DELAY_MS));
++    ESP_ERROR_CHECK(esp_wifi_set_channel(channel, get_secondary_channel(channel)));
++    printf("RF_CHANNEL,%u\n", channel);
++    return ESP_OK;
++}
++
++static void cmd_register_rf_channel(void)
++{
++    rf_channel_args.set = arg_int0(NULL, "set", "<1|6|11>", "Switch TX and RX Wi-Fi channel");
++    rf_channel_args.end = arg_end(2);
++
++    const esp_console_cmd_t cmd = {
++        .command = "rf_channel",
++        .help = "Query or switch the development RF channel",
++        .hint = NULL,
++        .func = &rf_channel_cmd,
++        .argtable = &rf_channel_args,
++    };
++    ESP_ERROR_CHECK(esp_console_cmd_register(&cmd));
++}
++
+ static struct {
+     struct arg_lit *train_start;
+     struct arg_lit *train_stop;
+@@ -605,6 +695,7 @@ void app_main(void)
+ #endif
+ #endif
+     wifi_init();
++    espnow_init();
+
+     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
+     ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
+@@ -614,6 +705,7 @@ void app_main(void)
+     cmd_register_wifi_config();
+     cmd_register_wifi_scan();
+     cmd_register_radar();
++    cmd_register_rf_channel();
+     ESP_ERROR_CHECK(esp_console_start_repl(repl));
+
+     /**
+diff --git a/examples/esp-radar/console_test/tools/esp_csi_tool.py b/examples/esp-radar/console_test/tools/esp_csi_tool.py
+index a2723a7..8bab5a1 100755
+--- a/examples/esp-radar/console_test/tools/esp_csi_tool.py
++++ b/examples/esp-radar/console_test/tools/esp_csi_tool.py
+@@ -130,6 +130,7 @@ g_radar_eigenvalue_threshold_array = np.zeros(
+     [RADAR_DATA_INDEX, RADAR_targetS_LEN], dtype=np.float32)
+ g_radar_status_array = np.zeros(
+     [RADAR_DATA_INDEX, RADAR_targetS_LEN], dtype=np.int32)
++g_radar_data_count = 0
+ g_evaluate_statistics_array = np.zeros(
+     [RADAR_targetS_LEN, RADAR_targetS_LEN], dtype=np.int32)
+
+@@ -563,11 +564,30 @@ class DataGraphicalWindow(QMainWindow, Ui_MainWindow):
+         self.wave_filtering_flag = self.checkBox_wave_filtering.isChecked()
+
+     def show_curve_eigenvalue(self):
++        sample_count = max(1, g_radar_data_count)
++        eigenvalues = g_radar_eigenvalue_array[-sample_count:]
++        thresholds = g_radar_eigenvalue_threshold_array[-sample_count:]
++
+         for i in range(RADAR_targetS_LEN):
+             self.curve_radar_eigenvalue[i].setData(
+-                g_radar_eigenvalue_array[:, i])
++                eigenvalues[:, i])
+             self.curve_radar_eigenvalue_threshold[i].setData(
+-                g_radar_eigenvalue_threshold_array[:, i])
++                thresholds[:, i])
++
++        visible_values = np.concatenate((
++            eigenvalues.ravel(),
++            thresholds.ravel(),
++        ))
++        visible_values = visible_values[np.isfinite(visible_values)]
++        if visible_values.size:
++            y_min = float(np.min(visible_values))
++            y_max = float(np.max(visible_values))
++            span = max(y_max - y_min, 0.001)
++            padding = span * 0.1
++            self.graphicsView_eigenvalues.setYRange(
++                y_min - padding, y_max + padding, padding=0)
++        self.graphicsView_eigenvalues.setXRange(
++            0, max(sample_count - 1, 1), padding=0.02)
+
+         curve_radar_title = f"{ROOM_STATUS_NAMES[g_radar_status_array[-1,0]]} {HUMAN_STATUS_NAMES[g_radar_status_array[-1,1]]}"
+         self.graphicsView_eigenvalues.setTitle(curve_radar_title)
+@@ -932,7 +952,7 @@ def radar_data_handle(self, data):
+                                        1] = g_radar_eigenvalue_threshold_array[1:]
+     g_radar_status_array[:-1] = g_radar_status_array[1:]
+
+-    global g_current_time
++    global g_current_time, g_radar_data_count
+
+     current_time_str = data['timestamp']
+     g_current_time = datetime.strptime(
+@@ -944,6 +964,8 @@ def radar_data_handle(self, data):
+             f"waveform_{RADAR_WAVEFORM_NAMES[taget_index]}_threshold"]
+         g_radar_status_array[-1][taget_index] = data[f"{RADAR_targetS_NAMES[taget_index]}_status"]
+
++    g_radar_data_count = min(g_radar_data_count + 1, RADAR_DATA_INDEX)
++
+     if g_radar_status_array[-1][0] != g_radar_status_array[-2][0] or g_radar_status_array[-1][1] != g_radar_status_array[-2][1]:
+         g_status_record_pd[1:] = g_status_record_pd[:-1]
+
+@@ -1074,12 +1096,14 @@ def serial_handle(queue_read, queue_write, port):
+                                          ["RADAR_DADA", RADAR_DATA_COLUMNS_NAMES, "log/radar_data.csv", None, None],
+                                          ["DEVICE_INFO", DEVICE_INFO_COLUMNS_NAMES, "log/device_info.csv", None, None]])
+
+-    for data_valid in data_valid_list.iloc:
++    for index, data_valid in data_valid_list.iterrows():
+         # print(type(data_valid), data_valid)
+         # print(f"file_name: {data_valid['file_name']}")
+-        data_valid['file_fd'] = open(data_valid['file_name'], 'w')
+-        data_valid['file_writer'] = csv.writer(data_valid['file_fd'])
+-        data_valid['file_writer'].writerow(data_valid['columns_names'])
++        file_fd = open(data_valid['file_name'], 'w')
++        file_writer = csv.writer(file_fd)
++        file_writer.writerow(data_valid['columns_names'])
++        data_valid_list.at[index, 'file_fd'] = file_fd
++        data_valid_list.at[index, 'file_writer'] = file_writer
+
+     log_data_writer = open("log/log_data.txt", 'w+')
+     taget_last = 'unknown'
+diff --git a/examples/get-started/csi_send/main/app_main.c b/examples/get-started/csi_send/main/app_main.c
+index ea99250..020879b 100644
+--- a/examples/get-started/csi_send/main/app_main.c
++++ b/examples/get-started/csi_send/main/app_main.c
+@@ -11,6 +11,9 @@
+ #include <stdlib.h>
+ #include <unistd.h>
+
++#include "freertos/FreeRTOS.h"
++#include "freertos/task.h"
++
+ #include "nvs_flash.h"
+
+ #include "esp_mac.h"
+@@ -20,11 +23,45 @@
+ #include "esp_now.h"
+
+
+-#define CONFIG_LESS_INTERFERENCE_CHANNEL    11
++#define CONFIG_LESS_INTERFERENCE_CHANNEL    6
+ #define CONFIG_SEND_FREQUENCY               100
++#define RF_CONTROL_MAGIC                    0x43534952
++#define RF_CONTROL_VERSION                  1
++#define RF_SWITCH_DELAY_MS                  650
+
+ static const uint8_t CONFIG_CSI_SEND_MAC[] = {0x1a, 0x00, 0x00, 0x00, 0x00, 0x00};
+ static const char *TAG = "csi_send";
++static volatile uint8_t g_pending_channel = 0;
++static volatile uint8_t g_current_channel = CONFIG_LESS_INTERFERENCE_CHANNEL;
++
++typedef struct __attribute__((packed)) {
++    uint32_t magic;
++    uint8_t version;
++    uint8_t channel;
++} rf_control_packet_t;
++
++static wifi_second_chan_t get_secondary_channel(uint8_t channel)
++{
++    return channel == 11 ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
++}
++
++static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len)
++{
++    if (!info || !data || data_len != sizeof(rf_control_packet_t)) {
++        return;
++    }
++
++    const rf_control_packet_t *packet = (const rf_control_packet_t *)data;
++    if (packet->magic != RF_CONTROL_MAGIC || packet->version != RF_CONTROL_VERSION
++            || (packet->channel != 1 && packet->channel != 6 && packet->channel != 11)) {
++        return;
++    }
++
++    if (packet->channel != g_current_channel && !g_pending_channel) {
++        g_pending_channel = packet->channel;
++        ESP_LOGI(TAG, "Channel switch requested: %u", packet->channel);
++    }
++}
+
+ static void wifi_init()
+ {
+@@ -42,7 +79,8 @@ static void wifi_init()
+     ESP_ERROR_CHECK(esp_wifi_config_espnow_rate(ESP_IF_WIFI_STA, WIFI_PHY_RATE_MCS0_SGI));
+     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
+-    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
++    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
++                                         get_secondary_channel(CONFIG_LESS_INTERFERENCE_CHANNEL)));
+     ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
+ }
+
+@@ -70,9 +108,10 @@ void app_main()
+      */
+     ESP_ERROR_CHECK(esp_now_init());
+     ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
++    ESP_ERROR_CHECK(esp_now_register_recv_cb(espnow_recv_cb));
+
+     esp_now_peer_info_t peer = {
+-        .channel   = CONFIG_LESS_INTERFERENCE_CHANNEL,
++        .channel   = 0,
+         .ifidx     = WIFI_IF_STA,    
+         .encrypt   = false,   
+         .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
+@@ -84,6 +123,15 @@ void app_main()
+              CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, MAC2STR(CONFIG_CSI_SEND_MAC));
+
+     for (uint8_t count = 0; ;++count) {
++        if (g_pending_channel) {
++            uint8_t channel = g_pending_channel;
++            vTaskDelay(pdMS_TO_TICKS(RF_SWITCH_DELAY_MS));
++            ESP_ERROR_CHECK(esp_wifi_set_channel(channel, get_secondary_channel(channel)));
++            g_current_channel = channel;
++            g_pending_channel = 0;
++            ESP_LOGI(TAG, "RF_CHANNEL,%u", channel);
++        }
++
+         esp_err_t ret = esp_now_send(peer.peer_addr, &count, sizeof(uint8_t));
+
+         if(ret != ESP_OK) {

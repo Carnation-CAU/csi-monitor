@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "1.0.0",
+  "espIdf": "v5.0.2",
+  "espIdfPathWindowsDefault": "%USERPROFILE%/esp/esp-idf-v5.0.2",
+  "espCsiCommit": "740083e5ac0067b8e5ba812d2d08fd94f8ce0348",
+  "python": "3.12.10"
+}

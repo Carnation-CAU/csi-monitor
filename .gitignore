@@ -1,0 +1,27 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+build/
+sdkconfig
+sdkconfig.old
+# 수집 데이터와 공간 프로필은 개인 환경 정보(집 배치, 보드 MAC, 생활 패턴)를
+# 담으므로 저장소에 올리지 않는다. 폴더 구조만 .gitkeep으로 유지한다.
+# 특정 세션을 공유해야 하면 개인정보를 지운 뒤 예외 규칙을 명시적으로 추가한다.
+data/raw/**
+data/interim/**
+data/manifests/**
+data/processed/**
+data/profiles/**
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/manifests/.gitkeep
+!data/processed/.gitkeep
+!data/profiles/.gitkeep
+
+third_party/esp-csi/
