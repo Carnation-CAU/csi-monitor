@@ -78,28 +78,29 @@ Python은 3.10 이상이면 동작한다. 펌웨어를 직접 빌드할 때만 3
 ## 📋 Branch Name Convention
 브랜치의 이름은 다음과 같은 규칙을 따릅니다.
 
-| type       | name                | description               |
-|------------|---------------------|---------------------------|
-| `feat`     | `feat/#ISSUE_NUM`     | ⚡️ 새로운 기능 추가            |
-| `fix`      | `fix/#ISSUE_NUM`      | 🐛 버그 수정                 |
-| `docs`     | `docs/#ISSUE_NUM`     | 📝 문서 수정                 |
-| `refactor` | `refactor/#ISSUE_NUM` | 💫 리팩토링                  |
-| `test`     | `test/#ISSUE_NUM`     | 🧪 테스트 코드 작성            |
-| `chore`    | `chore/#ISSUE_NUM`    | 🛠️ 빌드, 패키지 관련 수정       |
-| `perf`     | `perf/#ISSUE_NUM`     | 🪄 성능 개선                 |
-| `ci`       | `ci/#ISSUE_NUM`       | 🔄 CI 관련 수정              |
-| `cd`       | `cd/#ISSUE_NUM`       | 🔄 CD 관련 수정              |
-| `revert`   | `revert/#ISSUE_NUM`   | ⚠️ 특정 커밋으로 되돌리기         |
-| `hotfix`   | `hotfix/#ISSUE_NUM`   | 🔥 배포된 사항 중 시급히 수정 필요한 것 |
-| `docker`   | `docker/#ISSUE_NUM`   | 🐳 Docker 작업             |
+| type       | name                  | description                |
+|------------|-----------------------|----------------------------|
+| `feat`     | `feat/#ISSUE_NUM`     | ⚡️ 새로운 기능 추가             |
+| `fix`      | `fix/#ISSUE_NUM`      | 🐛 버그 수정                  |
+| `exp`      | `exp/#ISSUE_NUM`      | 🔬 측정·분석 실험               |
+| `docs`     | `docs/#ISSUE_NUM`     | 📝 문서 수정                  |
+| `refactor` | `refactor/#ISSUE_NUM` | 💫 리팩토링                   |
+| `test`     | `test/#ISSUE_NUM`     | 🧪 테스트 코드 작성             |
+| `chore`    | `chore/#ISSUE_NUM`    | 🛠️ 빌드, 패키지, 스크립트 관련 수정 |
 
 이후, 이 브랜치에서 작업하는 내용을 누구나 알 수 있도록 명시합니다.
-완성 예시 : `feat/#1-login-api`
+완성 예시 : `feat/#1-space-profile-save`
+
+### `exp` 브랜치는 병합하지 않아도 됩니다
+채널 비교, 배치 변경, 임계값 조정처럼 **결과를 확인하는 것이 목적인 작업**에 사용합니다.
+코드가 남을 필요는 없고, 결론만 `docs/` 문서로 정리해 별도 PR로 병합합니다.
+`feat`와 섞으면 병합되지 않은 브랜치의 이유를 알 수 없게 되므로 구분합니다.
 
 ## ⚠️ Issue Convention
 이슈 제목은 **타입**과 간단한 **설명**을 적습니다.
 
-ex. `[Feat] 상품 CRUD 구현`
+ex. `[Feat] 공간 프로필 저장·복원 구현`
+ex. `[Exp] 채널 1·6·11 링크 품질 비교`
 
 ## 📄 Commit Convention
 - 최소 작업 단위로 가능한 한 **작게 쪼개어 커밋**합니다.
@@ -109,8 +110,8 @@ ex. `[Feat] 상품 CRUD 구현`
 커밋 메시지 구조는 다음과 같습니다.
 
 ```text
-feat: 상품 조회 기능 구현
-fix: 상품 조회 중, 잘못된 ID인 경우 예외를 던지도록 수정
+feat: 공간 프로필에 보정 임계값 저장 기능 구현
+fix: RX 부팅 로그가 없을 때 프로필 MAC이 비지 않도록 수정
 ```
 
 커밋 `Prefix`의 경우, 브랜치 네이밍 타입과 동일한 방식으로 작성합니다.
