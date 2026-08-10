@@ -14,6 +14,7 @@ ESP32-S3 송신기 → ESP32-S3 CSI 수신기 → PC 수집기
 - 버전이 지정된 JSON Lines 원본 저장 형식과 세션 manifest
 - 공간 프로필(배치·채널·보정값) 저장과 복원
 - 채널 1·6·11 자동 비교와 빈 공간 보정
+- `someone`·`moving` 기반 실험용 재실·부재 상태 안정화
 - 행동 라벨 안내형 수집과 특징 CSV 생성
 - ESP-IDF 없이 업로드 가능한 완성 펌웨어 (`firmware/prebuilt`)
 - Espressif `esp-csi` 고정 커밋과 프로젝트 패치

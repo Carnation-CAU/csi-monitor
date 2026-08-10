@@ -18,6 +18,7 @@ from .collection import (
     summarize_collection,
 )
 from .features import build_profile_feature_rows, extract_session_features
+from .presence import PresenceDecision, PresenceDetector, PresenceState
 from .profiles import (
     append_profile_session,
     archive_profile,
@@ -119,6 +120,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.resize(1050, 780)
             self.project_root = Path(project_root).resolve()
             self.active_profile = load_or_create_profile(self.project_root)
+            self.presence_detector = PresenceDetector()
 
             self.jitter_values: deque[float] = deque(maxlen=100)
             self.threshold_values: deque[float] = deque(maxlen=100)
@@ -161,6 +163,13 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.status.setFont(QFont("Arial", 28, QFont.Bold))
             self.status.setStyleSheet(
                 "background:#343a40;color:white;padding:18px;border-radius:8px;"
+            )
+
+            self.presence_status = QLabel("재실 상태: 판단 대기")
+            self.presence_status.setAlignment(Qt.AlignCenter)
+            self.presence_status.setFont(QFont("Arial", 15, QFont.Bold))
+            self.presence_status.setStyleSheet(
+                "background:#b54708;color:white;padding:12px;border-radius:6px;"
             )
 
             self.details = QLabel(f"Port: {port}  |  Baud: {baud:,}")
@@ -270,6 +279,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
 
             layout = QVBoxLayout()
             layout.addWidget(self.status)
+            layout.addWidget(self.presence_status)
             layout.addWidget(self.link_status)
             layout.addWidget(self.channel_status)
             layout.addWidget(self.details)
@@ -340,6 +350,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             if not profile_id:
                 return
             self.active_profile = load_profile(self.project_root, profile_id)
+            self.show_presence(self.presence_detector.reset("profile_changed"))
             self.refresh_profile_status()
 
         def add_space_profile(self) -> None:
@@ -372,7 +383,9 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             )
             if not accepted:
                 return
-            channel = self.current_channel or int(self.active_profile["radio"]["channel"])
+            channel = self.current_channel or int(
+                self.active_profile["radio"]["channel"]
+            )
             self.active_profile = create_profile(
                 self.project_root,
                 display_name=display_name,
@@ -380,6 +393,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 distance_meters=distance,
                 channel=channel,
             )
+            self.show_presence(self.presence_detector.reset("calibration_required"))
             self.refresh_profile_list(self.active_profile["profileId"])
             QMessageBox.information(
                 self,
@@ -419,6 +433,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             )
             remaining_profiles = list_profiles(self.project_root)
             self.active_profile = remaining_profiles[0]
+            self.show_presence(self.presence_detector.reset("profile_changed"))
             self.refresh_profile_list(self.active_profile["profileId"])
             QMessageBox.information(
                 self,
@@ -445,6 +460,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 return
 
             channel = int(self.active_profile["radio"]["channel"])
+            self.show_presence(self.presence_detector.reset("profile_applied"))
             self.reader.send_command(f"rf_channel --set {channel}")
             calibration = self.active_profile.get("calibration")
             if calibration is None:
@@ -824,7 +840,13 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             if reply != QMessageBox.Yes:
                 return
 
+            channel = self.current_channel or int(
+                self.active_profile["radio"]["channel"]
+            )
+            update_profile_channel(self.project_root, self.active_profile, channel)
+            self.refresh_profile_status()
             self.scanning_channels = True
+            self.show_presence(self.presence_detector.reset("measurement_in_progress"))
             self.scan_index = 0
             self.scan_phase = "leaving"
             self.scan_deadline = monotonic() + 10
@@ -932,6 +954,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.set_collection_controls_enabled(True)
             selected = self.selected_scan_channel
             update_profile_channel(self.project_root, self.active_profile, selected)
+            self.show_presence(self.presence_detector.reset("calibration_required"))
             self.refresh_profile_status()
             self.status.setText(
                 f"CHANNEL {selected} SELECTED - CALIBRATE EMPTY ROOM"
@@ -958,6 +981,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.channel_scan_timer.stop()
             self.scanning_channels = False
             self.scan_phase = ""
+            self.show_presence(self.presence_detector.reset("measurement_failed"))
             self.set_collection_controls_enabled(True)
             self.status.setText("CHANNEL COMPARISON FAILED")
             self.status.setStyleSheet(
@@ -977,7 +1001,13 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             if reply != QMessageBox.Yes:
                 return
 
+            channel = self.current_channel or int(
+                self.active_profile["radio"]["channel"]
+            )
+            update_profile_channel(self.project_root, self.active_profile, channel)
+            self.refresh_profile_status()
             self.calibrating = True
+            self.show_presence(self.presence_detector.reset("calibrating"))
             self.calibration_stage = "delay"
             self.calibration_remaining = 10
             self.set_collection_controls_enabled(False)
@@ -1044,6 +1074,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 someone_threshold=sample.someone_threshold,
                 move_threshold=sample.move_threshold,
             )
+            self.show_presence(self.presence_detector.reset("warming_up"))
             self.set_collection_controls_enabled(True)
             self.refresh_profile_status()
             self.status.setText("CALIBRATION COMPLETE - PROFILE SAVED")
@@ -1067,7 +1098,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
 
         def update_sample(self, sample: RadarSample) -> None:
             self.sample_count += 1
-            self.last_sample_at = monotonic()
+            now = monotonic()
+            self.last_sample_at = now
             self.last_link_at = self.last_sample_at
             self.jitter_values.append(sample.jitter)
             self.threshold_values.append(sample.move_threshold)
@@ -1088,6 +1120,16 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.jitter_curve.setData(x_values, list(self.jitter_values))
             self.threshold_curve.setData(x_values, list(self.threshold_values))
             self.plot.enableAutoRange(axis="y")
+
+            if self.scanning_channels or self.calibrating:
+                presence = self.presence_detector.reset("measurement_in_progress")
+            else:
+                presence = self.presence_detector.update(
+                    sample,
+                    calibrated=self.is_presence_calibrated(),
+                    observed_at=now,
+                )
+            self.show_presence(presence)
 
             if self.scanning_channels or self.collecting:
                 pass
@@ -1143,23 +1185,72 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
         def update_health(self) -> None:
             if self.calibrating or self.scanning_channels or self.collecting:
                 return
-            if self.last_sample_at and monotonic() - self.last_sample_at > 10:
+            now = monotonic()
+            self.show_presence(
+                self.presence_detector.health(
+                    calibrated=self.is_presence_calibrated(),
+                    observed_at=now,
+                )
+            )
+            if self.last_sample_at and now - self.last_sample_at > 10:
                 self.status.setText("WAITING FOR NEXT RADAR RESULT")
                 self.status.setStyleSheet(
                     "background:#b54708;color:white;padding:18px;border-radius:8px;"
                 )
-            if self.last_link_at and monotonic() - self.last_link_at > 10:
+            if self.last_link_at and now - self.last_link_at > 10:
                 self.link_status.setText("Wi-Fi CSI link data paused")
                 self.link_status.setStyleSheet(
                     "background:#b42318;color:white;padding:10px;border-radius:6px;"
                 )
 
         def show_error(self, message: str) -> None:
+            self.show_presence(self.presence_detector.reset("serial_error"))
             self.status.setText("SERIAL ERROR")
             self.status.setStyleSheet(
                 "background:#b42318;color:white;padding:18px;border-radius:8px;"
             )
             self.details.setText(message)
+
+        def is_presence_calibrated(self) -> bool:
+            return (
+                not bool(self.active_profile.get("needsCalibration", True))
+                and self.active_profile.get("calibration") is not None
+            )
+
+        def show_presence(self, decision: PresenceDecision) -> None:
+            if decision.state == PresenceState.PRESENT_ACTIVE:
+                label, detail, color = "재실", "움직임 있음", "#087f3d"
+            elif decision.state == PresenceState.PRESENT_STATIC:
+                label, detail, color = "재실", "정지 상태", "#087f3d"
+            elif decision.state == PresenceState.ABSENT:
+                label, detail, color = "부재", "빈 상태 지속 확인", "#175cd3"
+            else:
+                reasons = {
+                    "calibration_required": "빈 공간 보정 필요",
+                    "calibrating": "빈 공간 보정 중",
+                    "measurement_in_progress": "채널 비교 또는 보정 중",
+                    "measurement_failed": "채널 비교 실패",
+                    "radar_timeout": "Radar 데이터 중단",
+                    "serial_error": "직렬 통신 오류",
+                    "waiting_for_samples": "Radar 데이터 대기",
+                    "warming_up": "판정 데이터 수집 중",
+                    "confirming_presence": "재실 여부 확인 중",
+                    "confirming_absence": "부재 지속 시간 확인 중",
+                    "ambiguous_signal": "경계 신호 확인 중",
+                    "profile_changed": "공간 프로필 변경됨",
+                    "profile_applied": "프로필 적용 후 재확인 중",
+                }
+                label = "판단 불가"
+                detail = reasons.get(decision.reason, "Radar 데이터 대기")
+                color = "#b54708"
+
+            ratio = decision.presence_ratio * 100
+            self.presence_status.setText(
+                f"재실 상태: {label} · {detail} · 재실 신호 {ratio:.0f}%"
+            )
+            self.presence_status.setStyleSheet(
+                f"background:{color};color:white;padding:12px;border-radius:6px;"
+            )
 
         def closeEvent(self, event) -> None:
             if self.calibrating and self.calibration_stage == "training":
