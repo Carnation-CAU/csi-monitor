@@ -10,6 +10,28 @@ __pycache__/
 build/
 sdkconfig
 sdkconfig.old
+
+# 운영체제 및 편집기 임시 파일
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+*.log
+
+# 로컬 AI 도구 설정 및 작업 파일
+.claude/
+CLAUDE.md
+CLAUDE.local.md
+.codex/
+.agents/
+AGENTS.md
+AGENTS.local.md
+.mcp.json
+
 # 수집 데이터와 공간 프로필은 개인 환경 정보(집 배치, 보드 MAC, 생활 패턴)를
 # 담으므로 저장소에 올리지 않는다. 폴더 구조만 .gitkeep으로 유지한다.
 # 특정 세션을 공유해야 하면 개인정보를 지운 뒤 예외 규칙을 명시적으로 추가한다.
