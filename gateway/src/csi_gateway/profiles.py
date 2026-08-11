@@ -71,6 +71,7 @@ def create_profile(
             "rxMac": rx_mac,
         },
         "sessionIds": [],
+        "referenceDatasets": [],
         "notes": ["새 공간 프로필: 빈 공간 보정 필요"],
     }
     save_profile(project_root, profile)
@@ -115,6 +116,7 @@ def default_workspace_profile() -> dict[str, Any]:
             "rxMac": None,
         },
         "sessionIds": [],
+        "referenceDatasets": [],
         "notes": [
             "기본 프로필: 실제 배치를 기록하고 빈 공간 보정을 실행해야 함",
         ],
@@ -147,6 +149,46 @@ def update_profile_channel(
     profile["radio"]["channel"] = channel
     profile["calibration"] = None
     profile["needsCalibration"] = True
+    return save_profile(project_root, profile)
+
+
+def update_profile_details(
+    project_root: Path,
+    profile: dict[str, Any],
+    *,
+    display_name: str,
+    placement_description: str,
+    distance_meters: float,
+    tx_position: str,
+    rx_position: str,
+) -> Path:
+    """공간 이름과 실제 배치 정보를 수정한다.
+
+    이름만 바뀌면 기존 보정값을 유지한다. CSI는 거리와 위치 같은 물리적 배치에
+    민감하므로 배치 정보가 하나라도 달라지면 저장된 보정값을 무효화한다.
+    """
+    placement = profile.setdefault("placement", {})
+    placement_changed = any(
+        (
+            placement.get("description", "") != placement_description.strip(),
+            placement.get("txRxDistanceMeters") != distance_meters,
+            placement.get("txPosition", "") != tx_position.strip(),
+            placement.get("rxPosition", "") != rx_position.strip(),
+        )
+    )
+
+    profile["displayName"] = display_name.strip()
+    placement["description"] = placement_description.strip()
+    placement["txRxDistanceMeters"] = distance_meters
+    placement["txPosition"] = tx_position.strip()
+    placement["rxPosition"] = rx_position.strip()
+
+    if placement_changed:
+        profile["calibration"] = None
+        profile["needsCalibration"] = True
+        profile.setdefault("notes", []).append(
+            "배치 정보 수정: 빈 공간 보정 다시 필요"
+        )
     return save_profile(project_root, profile)
 
 

@@ -1,15 +1,29 @@
 import unittest
 
-from csi_gateway.presence import PresenceDetector, PresenceState
+from csi_gateway.presence import (
+    PresenceDetector,
+    PresenceState,
+    build_static_presence_baseline,
+)
 from csi_gateway.radar import RadarSample
 
 
-def radar_sample(*, someone: bool = False, moving: bool = False) -> RadarSample:
+def radar_sample(
+    *,
+    someone: bool = False,
+    moving: bool = False,
+    relative_wander: float | None = None,
+) -> RadarSample:
+    someone_threshold = 0.05
     return RadarSample(
         sequence=1,
         timestamp="0",
-        wander=0.1 if someone else 0.0,
-        someone_threshold=0.05,
+        wander=(
+            relative_wander * someone_threshold
+            if relative_wander is not None
+            else (0.1 if someone else 0.0)
+        ),
+        someone_threshold=someone_threshold,
         someone=someone,
         jitter=0.1 if moving else 0.0,
         move_threshold=0.05,
@@ -28,6 +42,64 @@ class PresenceDetectorTests(unittest.TestCase):
         }
         settings.update(overrides)
         return PresenceDetector(**settings)
+
+    def test_static_baseline_requires_separated_empty_and_present_sessions(self):
+        baseline = build_static_presence_baseline(
+            [
+                {"label": "empty_room", "wander_relative_mean": 3.2},
+                {"label": "lying_static", "wander_relative_mean": 8.3},
+                {"label": "lying_static", "wander_relative_mean": 24.1},
+            ]
+        )
+        self.assertIsNotNone(baseline)
+        self.assertAlmostEqual(baseline.empty_anchor, 3.2)
+        self.assertAlmostEqual(baseline.present_anchor, 8.3)
+
+        overlapping = build_static_presence_baseline(
+            [
+                {"label": "empty_room", "wander_relative_mean": 4.0},
+                {"label": "lying_static", "wander_relative_mean": 4.2},
+            ]
+        )
+        self.assertIsNone(overlapping)
+
+    def test_static_baseline_can_override_wrong_official_someone_for_empty_room(self):
+        baseline = build_static_presence_baseline(
+            [
+                {"label": "empty_room", "wander_relative_mean": 3.2},
+                {"label": "lying_static", "wander_relative_mean": 8.3},
+            ]
+        )
+        detector = self.make_detector(
+            static_baseline=baseline,
+            absence_confirm_seconds=1.0,
+        )
+        for observed_at in (0.0, 0.5, 1.0, 2.0):
+            decision = detector.update(
+                radar_sample(someone=True, relative_wander=3.0),
+                calibrated=True,
+                observed_at=observed_at,
+            )
+        self.assertEqual(decision.state, PresenceState.ABSENT)
+
+    def test_static_baseline_detects_still_person_when_official_someone_is_false(self):
+        baseline = build_static_presence_baseline(
+            [
+                {"label": "empty_room", "wander_relative_mean": 3.2},
+                {"label": "lying_static", "wander_relative_mean": 8.3},
+            ]
+        )
+        detector = self.make_detector(
+            static_baseline=baseline,
+            presence_confirm_seconds=0.0,
+        )
+        for observed_at in (0.0, 0.5, 1.0):
+            decision = detector.update(
+                radar_sample(someone=False, relative_wander=9.0),
+                calibrated=True,
+                observed_at=observed_at,
+            )
+        self.assertEqual(decision.state, PresenceState.PRESENT_STATIC)
 
     def test_uncalibrated_profile_is_unknown(self):
         detector = self.make_detector()

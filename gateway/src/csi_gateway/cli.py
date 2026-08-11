@@ -155,6 +155,34 @@ def build_parser() -> argparse.ArgumentParser:
     features_parser.add_argument("--profile-id", required=True)
     features_parser.add_argument("--project-root", default=".")
     features_parser.add_argument("--output")
+
+    dataset_export_parser = subparsers.add_parser(
+        "dataset-export", help="Export one profile as a native dataset bundle"
+    )
+    dataset_export_parser.add_argument("--profile-id", required=True)
+    dataset_export_parser.add_argument("--output", required=True)
+    dataset_export_parser.add_argument("--name")
+    dataset_export_parser.add_argument("--project-root", default=".")
+
+    dataset_import_parser = subparsers.add_parser(
+        "dataset-import", help="Import a native dataset bundle"
+    )
+    dataset_import_parser.add_argument("--bundle", required=True)
+    dataset_import_parser.add_argument("--project-root", default=".")
+
+    dataset_list_parser = subparsers.add_parser(
+        "dataset-list", help="List imported datasets"
+    )
+    dataset_list_parser.add_argument("--project-root", default=".")
+
+    for command, help_text in (
+        ("dataset-attach", "Attach a reference dataset to a profile"),
+        ("dataset-detach", "Detach a reference dataset from a profile"),
+    ):
+        dataset_profile_parser = subparsers.add_parser(command, help=help_text)
+        dataset_profile_parser.add_argument("--profile-id", required=True)
+        dataset_profile_parser.add_argument("--dataset-id", required=True)
+        dataset_profile_parser.add_argument("--project-root", default=".")
     return parser
 
 
@@ -180,6 +208,43 @@ def export_features(args: argparse.Namespace) -> int:
     return 0
 
 
+def manage_dataset(args: argparse.Namespace) -> int:
+    from .datasets import (
+        attach_dataset_to_profile,
+        detach_dataset_from_profile,
+        export_profile_dataset,
+        import_dataset_bundle,
+        list_datasets,
+    )
+    from .profiles import load_profile
+
+    project_root = Path(args.project_root).resolve()
+    if args.command == "dataset-export":
+        output = export_profile_dataset(
+            project_root,
+            args.profile_id,
+            Path(args.output),
+            display_name=args.name,
+        )
+        print(output)
+        return 0
+    if args.command == "dataset-import":
+        dataset = import_dataset_bundle(project_root, Path(args.bundle))
+        print(json.dumps(dataset, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "dataset-list":
+        print(json.dumps(list_datasets(project_root), ensure_ascii=False, indent=2))
+        return 0
+
+    profile = load_profile(project_root, args.profile_id)
+    if args.command == "dataset-attach":
+        attach_dataset_to_profile(project_root, profile, args.dataset_id)
+    else:
+        detach_dataset_from_profile(project_root, profile, args.dataset_id)
+    print(f"{args.command}: {args.dataset_id} -> {args.profile_id}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "ports":
@@ -194,6 +259,8 @@ def main(argv: list[str] | None = None) -> int:
         return run_monitor(args.port, args.baud, args.project_root)
     if args.command == "features":
         return export_features(args)
+    if args.command.startswith("dataset-"):
+        return manage_dataset(args)
     return 2
 
 

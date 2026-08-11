@@ -6,16 +6,16 @@ from statistics import fmean, pstdev
 
 
 REFERENCE_FEATURES = (
-    "wander_mean",
-    "wander_std",
-    "wander_max",
-    "jitter_mean",
-    "jitter_std",
-    "jitter_max",
+    "wander_relative_mean",
+    "wander_relative_std",
+    "wander_relative_max",
+    "jitter_relative_mean",
+    "jitter_relative_std",
+    "jitter_relative_max",
     "moving_ratio",
     "someone_ratio",
-    "first_half_jitter_mean",
-    "second_half_jitter_mean",
+    "first_half_jitter_relative_mean",
+    "second_half_jitter_relative_mean",
 )
 
 

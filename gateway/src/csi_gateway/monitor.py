@@ -14,11 +14,30 @@ from .collection import (
     COLLECTION_LABELS,
     FALL_LABELS,
     TRANSITION_LABELS,
+    UNLABELED,
+    finalize_collection_label,
     render_korean_summary,
     summarize_collection,
 )
-from .features import build_profile_feature_rows, extract_session_features
-from .presence import PresenceDecision, PresenceDetector, PresenceState
+from .features import (
+    build_current_calibration_presence_rows,
+    build_profile_feature_rows,
+    extract_session_features,
+)
+from .datasets import (
+    DatasetError,
+    attach_dataset_to_profile,
+    detach_dataset_from_profile,
+    export_profile_dataset,
+    import_dataset_bundle,
+    list_datasets,
+)
+from .presence import (
+    PresenceDecision,
+    PresenceDetector,
+    PresenceState,
+    build_static_presence_baseline,
+)
 from .profiles import (
     append_profile_session,
     archive_profile,
@@ -28,6 +47,7 @@ from .profiles import (
     load_or_create_profile,
     update_profile_calibration,
     update_profile_channel,
+    update_profile_details,
     update_profile_rx_mac,
 )
 from .radar import (
@@ -52,8 +72,10 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
         QApplication,
         QCheckBox,
         QComboBox,
+        QFileDialog,
         QGroupBox,
         QLabel,
+        QLineEdit,
         QMainWindow,
         QMessageBox,
         QInputDialog,
@@ -121,6 +143,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.project_root = Path(project_root).resolve()
             self.active_profile = load_or_create_profile(self.project_root)
             self.presence_detector = PresenceDetector()
+            self.refresh_presence_baseline()
 
             self.jitter_values: deque[float] = deque(maxlen=100)
             self.threshold_values: deque[float] = deque(maxlen=100)
@@ -149,6 +172,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_event_at: str | None = None
             self.collection_session_id = ""
             self.collection_label = ""
+            self.collection_planned_label: str | None = None
             self.collection_output = None
             self.collection_manifest: dict[str, object] = {}
             self.collection_manifest_path: Path | None = None
@@ -199,6 +223,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.profile_combo.currentIndexChanged.connect(self.select_space_profile)
             self.profile_add_button = QPushButton("새 프로필 추가")
             self.profile_add_button.clicked.connect(self.add_space_profile)
+            self.profile_edit_button = QPushButton("선택 프로필 수정")
+            self.profile_edit_button.clicked.connect(self.edit_space_profile)
             self.profile_delete_button = QPushButton("선택 프로필 삭제")
             self.profile_delete_button.clicked.connect(self.delete_space_profile)
             self.profile_apply_button = QPushButton("공간 프로필 적용")
@@ -208,6 +234,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             profile_controls = QHBoxLayout()
             profile_controls.addWidget(self.profile_combo, 1)
             profile_controls.addWidget(self.profile_add_button)
+            profile_controls.addWidget(self.profile_edit_button)
             profile_controls.addWidget(self.profile_delete_button)
             profile_controls.addWidget(self.profile_apply_button)
             profile_layout = QVBoxLayout()
@@ -216,8 +243,38 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             profile_group = QGroupBox("공간 프로필")
             profile_group.setLayout(profile_layout)
 
+            self.dataset_combo = QComboBox()
+            self.dataset_combo.currentIndexChanged.connect(
+                self.select_reference_dataset
+            )
+            self.dataset_export_button = QPushButton("현재 프로필 데이터 내보내기")
+            self.dataset_export_button.clicked.connect(
+                self.export_active_profile_dataset
+            )
+            self.dataset_import_button = QPushButton("데이터셋 번들 가져오기")
+            self.dataset_import_button.clicked.connect(self.import_dataset_dialog)
+            self.dataset_attach_button = QPushButton("선택 데이터 연결")
+            self.dataset_attach_button.clicked.connect(
+                self.toggle_reference_dataset
+            )
+            self.dataset_status = QLabel()
+            self.dataset_status.setFont(QFont("Arial", 10))
+            dataset_controls = QHBoxLayout()
+            dataset_controls.addWidget(self.dataset_combo, 1)
+            dataset_controls.addWidget(self.dataset_export_button)
+            dataset_controls.addWidget(self.dataset_import_button)
+            dataset_controls.addWidget(self.dataset_attach_button)
+            dataset_layout = QVBoxLayout()
+            dataset_layout.addLayout(dataset_controls)
+            dataset_layout.addWidget(self.dataset_status)
+            dataset_group = QGroupBox("참조 데이터셋")
+            dataset_group.setLayout(dataset_layout)
+            self.refresh_dataset_list()
+
             self.collection_label_combo = QComboBox()
-            self.collection_label_combo.addItems(COLLECTION_LABELS)
+            self.collection_label_combo.addItem("수집 후 실제 행동 선택", None)
+            for collection_label in COLLECTION_LABELS:
+                self.collection_label_combo.addItem(collection_label, collection_label)
             self.collection_label_combo.currentTextChanged.connect(
                 self.update_collection_cue_default
             )
@@ -244,6 +301,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_cue_checkbox.toggled.connect(
                 self.collection_cue_spin.setEnabled
             )
+            self.collection_fall_safety_checkbox = QCheckBox("모의 낙상 안전 수집")
 
             self.collection_start_button = QPushButton("행동 수집 시작")
             self.collection_start_button.setFont(QFont("Arial", 11, QFont.Bold))
@@ -256,6 +314,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             collection_controls.addWidget(self.collection_duration_spin)
             collection_controls.addWidget(self.collection_cue_checkbox)
             collection_controls.addWidget(self.collection_cue_spin)
+            collection_controls.addWidget(self.collection_fall_safety_checkbox)
             collection_controls.addWidget(self.collection_start_button)
             collection_layout = QVBoxLayout()
             collection_layout.addLayout(collection_controls)
@@ -288,6 +347,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             button_layout.addWidget(self.calibrate_button)
             layout.addLayout(button_layout)
             layout.addWidget(profile_group)
+            layout.addWidget(dataset_group)
             layout.addWidget(collection_group)
             layout.addWidget(self.plot, 1)
             container = QWidget()
@@ -326,9 +386,24 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 calibration = "보정값 없음"
             else:
                 calibration = "보정값 저장됨"
+            static_presence = (
+                "정지 재실 기준 준비됨"
+                if self.presence_detector.static_baseline is not None
+                else "정지 재실 기준 미구성"
+            )
             self.profile_status.setText(
                 f"저장 채널 {channel}  |  {calibration}  |  "
-                f"연결 데이터 {len(self.active_profile.get('sessionIds', []))}개"
+                f"연결 데이터 {len(self.active_profile.get('sessionIds', []))}개  |  "
+                f"참조 데이터셋 {len(self.active_profile.get('referenceDatasets', []))}개  |  "
+                f"{static_presence}"
+            )
+
+        def refresh_presence_baseline(self) -> None:
+            rows = build_current_calibration_presence_rows(
+                self.project_root, self.active_profile["profileId"]
+            )
+            self.presence_detector.set_static_baseline(
+                build_static_presence_baseline(rows)
             )
 
         def refresh_profile_list(self, selected_profile_id: str) -> None:
@@ -342,6 +417,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.profile_combo.setCurrentIndex(selected_index)
             self.profile_combo.blockSignals(False)
             self.refresh_profile_status()
+            if hasattr(self, "dataset_combo"):
+                self.refresh_dataset_status()
 
         def select_space_profile(self, index: int) -> None:
             if index < 0:
@@ -350,8 +427,153 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             if not profile_id:
                 return
             self.active_profile = load_profile(self.project_root, profile_id)
+            self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("profile_changed"))
             self.refresh_profile_status()
+            if hasattr(self, "dataset_combo"):
+                self.refresh_dataset_status()
+
+        def refresh_dataset_list(self, selected_dataset_id: str | None = None) -> None:
+            datasets = list_datasets(self.project_root)
+            self.dataset_combo.blockSignals(True)
+            self.dataset_combo.clear()
+            selected_index = 0
+            if not datasets:
+                self.dataset_combo.addItem("가져온 데이터셋 없음", None)
+            else:
+                for index, dataset in enumerate(datasets):
+                    dataset_id = str(dataset["datasetId"])
+                    self.dataset_combo.addItem(str(dataset["displayName"]), dataset_id)
+                    if dataset_id == selected_dataset_id:
+                        selected_index = index
+                self.dataset_combo.setCurrentIndex(selected_index)
+            self.dataset_combo.blockSignals(False)
+            self.refresh_dataset_status()
+
+        def selected_dataset_id(self) -> str | None:
+            value = self.dataset_combo.currentData()
+            return str(value) if value else None
+
+        def select_reference_dataset(self, index: int) -> None:
+            if index >= 0:
+                self.refresh_dataset_status()
+
+        def refresh_dataset_status(self) -> None:
+            dataset_id = self.selected_dataset_id()
+            if dataset_id is None:
+                self.dataset_status.setText(
+                    "팀 ESP-Radar 데이터셋 번들을 가져오면 공간 프로필에 참조로 연결할 수 있습니다."
+                )
+                self.dataset_attach_button.setText("선택 데이터 연결")
+                self.dataset_attach_button.setEnabled(False)
+                return
+            dataset = next(
+                item
+                for item in list_datasets(self.project_root)
+                if item["datasetId"] == dataset_id
+            )
+            attached = any(
+                item.get("datasetId") == dataset_id
+                for item in self.active_profile.get("referenceDatasets", [])
+            )
+            labels = ", ".join(str(label) for label in dataset.get("labels", []))
+            self.dataset_status.setText(
+                f"세션 {len(dataset.get('sessions', []))}개  |  "
+                f"라벨 {labels or '없음'}  |  "
+                f"현재 프로필 {'연결됨' if attached else '연결 안 됨'}"
+            )
+            self.dataset_attach_button.setText(
+                "선택 데이터 연결 해제" if attached else "선택 데이터 연결"
+            )
+            self.dataset_attach_button.setEnabled(
+                not (self.calibrating or self.scanning_channels or self.collecting)
+            )
+
+        def export_active_profile_dataset(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
+            default_path = (
+                self.project_root
+                / "data"
+                / "exports"
+                / f"{self.active_profile['profileId']}.csi-dataset.zip"
+            )
+            selected_path, _ = QFileDialog.getSaveFileName(
+                self,
+                "현재 프로필 데이터셋 내보내기",
+                str(default_path),
+                "CSI 데이터셋 (*.csi-dataset.zip *.zip)",
+            )
+            if not selected_path:
+                return
+            output_path = Path(selected_path)
+            if output_path.suffix.lower() != ".zip":
+                output_path = output_path.with_name(
+                    output_path.name + ".csi-dataset.zip"
+                )
+            try:
+                export_profile_dataset(
+                    self.project_root,
+                    self.active_profile["profileId"],
+                    output_path,
+                )
+            except (DatasetError, OSError) as exc:
+                QMessageBox.warning(self, "데이터셋 내보내기 실패", str(exc))
+                return
+            QMessageBox.information(
+                self,
+                "데이터셋 내보내기 완료",
+                f"유효한 행동 세션을 공유 번들로 저장했습니다.\n{output_path}",
+            )
+
+        def import_dataset_dialog(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
+            selected_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "CSI 데이터셋 번들 가져오기",
+                str(self.project_root),
+                "CSI 데이터셋 (*.csi-dataset.zip *.zip)",
+            )
+            if not selected_path:
+                return
+            try:
+                dataset = import_dataset_bundle(
+                    self.project_root, Path(selected_path)
+                )
+            except (DatasetError, OSError) as exc:
+                QMessageBox.warning(self, "데이터셋 가져오기 실패", str(exc))
+                return
+            dataset_id = str(dataset["datasetId"])
+            self.refresh_dataset_list(dataset_id)
+            QMessageBox.information(
+                self,
+                "데이터셋 가져오기 완료",
+                f"{dataset['displayName']}\n"
+                f"세션 {len(dataset.get('sessions', []))}개를 확인했습니다.\n"
+                "필요하면 '선택 데이터 연결'을 눌러 현재 공간의 참고 데이터로 사용하세요.",
+            )
+
+        def toggle_reference_dataset(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
+            dataset_id = self.selected_dataset_id()
+            if dataset_id is None:
+                return
+            attached = any(
+                item.get("datasetId") == dataset_id
+                for item in self.active_profile.get("referenceDatasets", [])
+            )
+            if attached:
+                detach_dataset_from_profile(
+                    self.project_root, self.active_profile, dataset_id
+                )
+            else:
+                attach_dataset_to_profile(
+                    self.project_root, self.active_profile, dataset_id
+                )
+            self.refresh_profile_status()
+            self.refresh_dataset_status()
 
         def add_space_profile(self) -> None:
             if self.calibrating or self.scanning_channels or self.collecting:
@@ -393,6 +615,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 distance_meters=distance,
                 channel=channel,
             )
+            self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("calibration_required"))
             self.refresh_profile_list(self.active_profile["profileId"])
             QMessageBox.information(
@@ -433,6 +656,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             )
             remaining_profiles = list_profiles(self.project_root)
             self.active_profile = remaining_profiles[0]
+            self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("profile_changed"))
             self.refresh_profile_list(self.active_profile["profileId"])
             QMessageBox.information(
@@ -441,6 +665,106 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 f"{name} 프로필을 목록에서 제거했습니다.\n"
                 f"원본 데이터는 유지되며 프로필은 다음 위치에 보관했습니다.\n{archived_path}",
             )
+
+        def edit_space_profile(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
+
+            placement = self.active_profile["placement"]
+            display_name, accepted = QInputDialog.getText(
+                self,
+                "공간 프로필 수정",
+                "공간 이름",
+                QLineEdit.Normal,
+                str(self.active_profile["displayName"]),
+            )
+            display_name = display_name.strip()
+            if not accepted or not display_name:
+                return
+            description, accepted = QInputDialog.getText(
+                self,
+                "공간 프로필 수정",
+                "배치 설명",
+                QLineEdit.Normal,
+                str(placement.get("description", "")),
+            )
+            description = description.strip()
+            if not accepted or not description:
+                return
+            current_distance = placement.get("txRxDistanceMeters")
+            distance, accepted = QInputDialog.getDouble(
+                self,
+                "공간 프로필 수정",
+                "TX-RX 직선거리(m)",
+                float(current_distance) if current_distance is not None else 1.0,
+                0.1,
+                100.0,
+                1,
+            )
+            if not accepted:
+                return
+            tx_position, accepted = QInputDialog.getText(
+                self,
+                "공간 프로필 수정",
+                "TX 위치와 높이",
+                QLineEdit.Normal,
+                str(placement.get("txPosition", "")),
+            )
+            tx_position = tx_position.strip()
+            if not accepted or not tx_position:
+                return
+            rx_position, accepted = QInputDialog.getText(
+                self,
+                "공간 프로필 수정",
+                "RX 위치와 높이",
+                QLineEdit.Normal,
+                str(placement.get("rxPosition", "")),
+            )
+            rx_position = rx_position.strip()
+            if not accepted or not rx_position:
+                return
+
+            placement_changed = any(
+                (
+                    placement.get("description", "") != description,
+                    placement.get("txRxDistanceMeters") != distance,
+                    placement.get("txPosition", "") != tx_position,
+                    placement.get("rxPosition", "") != rx_position,
+                )
+            )
+            if placement_changed and not self.active_profile.get(
+                "needsCalibration", True
+            ):
+                reply = QMessageBox.question(
+                    self,
+                    "배치 변경 확인",
+                    "거리나 위치를 바꾸면 기존 빈 공간 보정값을 사용할 수 없습니다.\n"
+                    "수정 내용을 저장하고 보정 필요 상태로 바꿀까요?",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                )
+                if reply != QMessageBox.Yes:
+                    return
+
+            update_profile_details(
+                self.project_root,
+                self.active_profile,
+                display_name=display_name,
+                placement_description=description,
+                distance_meters=distance,
+                tx_position=tx_position,
+                rx_position=rx_position,
+            )
+            self.refresh_presence_baseline()
+            if placement_changed:
+                self.show_presence(
+                    self.presence_detector.reset("calibration_required")
+                )
+            self.refresh_profile_list(self.active_profile["profileId"])
+            message = "프로필 정보를 저장했습니다."
+            if placement_changed:
+                message += "\n최종 배치에서 빈 공간 보정을 다시 실행해 주세요."
+            QMessageBox.information(self, "프로필 수정 완료", message)
 
         def apply_space_profile(self) -> None:
             if self.calibrating or self.scanning_channels or self.collecting:
@@ -451,7 +775,9 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 "공간 프로필 적용",
                 f"프로필: {self.active_profile['displayName']}\n"
                 f"배치: {placement['description']}\n"
-                f"거리: 약 {placement['txRxDistanceMeters']}m\n\n"
+                f"거리: 약 {placement['txRxDistanceMeters']}m\n"
+                f"TX: {placement.get('txPosition', '')}\n"
+                f"RX: {placement.get('rxPosition', '')}\n\n"
                 "TX와 RX를 기록 당시 위치·높이·방향으로 놓았습니까?",
                 QMessageBox.Yes | QMessageBox.Cancel,
                 QMessageBox.Yes,
@@ -491,6 +817,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
 
         def update_collection_cue_default(self, label: str) -> None:
             self.collection_cue_checkbox.setChecked(label in TRANSITION_LABELS)
+            self.collection_fall_safety_checkbox.setChecked(label in FALL_LABELS)
 
         def update_collection_cue_limit(self, duration: int) -> None:
             self.collection_cue_spin.setMaximum(max(1, duration - 1))
@@ -502,6 +829,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_prep_spin.setEnabled(enabled)
             self.collection_duration_spin.setEnabled(enabled)
             self.collection_cue_checkbox.setEnabled(enabled)
+            self.collection_fall_safety_checkbox.setEnabled(enabled)
             self.collection_cue_spin.setEnabled(
                 enabled and self.collection_cue_checkbox.isChecked()
             )
@@ -510,19 +838,27 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.calibrate_button.setEnabled(enabled)
             self.profile_combo.setEnabled(enabled)
             self.profile_add_button.setEnabled(enabled)
+            self.profile_edit_button.setEnabled(enabled)
             self.profile_delete_button.setEnabled(enabled)
             self.profile_apply_button.setEnabled(enabled)
+            self.dataset_combo.setEnabled(enabled)
+            self.dataset_export_button.setEnabled(enabled)
+            self.dataset_import_button.setEnabled(enabled)
+            self.dataset_attach_button.setEnabled(
+                enabled and self.selected_dataset_id() is not None
+            )
 
         def start_collection(self) -> None:
             if self.calibrating or self.scanning_channels or self.collecting:
                 return
 
-            label = self.collection_label_combo.currentText()
+            planned_label = self.collection_label_combo.currentData()
+            display_label = planned_label or "수집 후 실제 행동 선택"
             duration = self.collection_duration_spin.value()
             cue_enabled = self.collection_cue_checkbox.isChecked()
             cue_offset = self.collection_cue_spin.value()
             self.collection_safety_confirmed = None
-            if label in FALL_LABELS:
+            if self.collection_fall_safety_checkbox.isChecked():
                 safety_reply = QMessageBox.question(
                     self,
                     "모의 낙상 안전 확인",
@@ -546,7 +882,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             reply = QMessageBox.question(
                 self,
                 "행동 데이터 수집",
-                f"라벨: {label}\n준비: {self.collection_prep_spin.value()}초\n"
+                f"예정 행동: {display_label}\n준비: {self.collection_prep_spin.value()}초\n"
                 f"수집: {duration}초\n\n수집을 시작할까요?",
                 QMessageBox.Yes | QMessageBox.Cancel,
                 QMessageBox.Yes,
@@ -561,9 +897,10 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_cue_enabled = cue_enabled
             self.collection_cue_offset = cue_offset
             self.collection_event_at = None
-            self.collection_label = label
+            self.collection_planned_label = planned_label
+            self.collection_label = UNLABELED
             self.collection_session_id = (
-                datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{label}"
+                datetime.now().strftime("%Y%m%d-%H%M%S") + "-collection"
             )
             self.collection_status.setText(
                 f"준비 중: {self.collection_remaining}초 남음"
@@ -596,7 +933,10 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 "deviceId": "rx-s3-001",
                 "profileId": self.active_profile["profileId"],
                 "roomId": self.active_profile["roomId"],
-                "label": self.collection_label,
+                "plannedLabel": self.collection_planned_label,
+                "label": UNLABELED,
+                "labelConfirmedAtEnd": False,
+                "labelCorrected": False,
                 "serialPort": port,
                 "baudRate": baud,
                 "platform": platform.platform(),
@@ -621,9 +961,9 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_phase = "recording"
             QApplication.beep()
             self.collection_status.setText(
-                f"수집 중: {self.collection_label} | {self.collection_remaining}초 남음"
+                f"수집 중: 실제 행동은 종료 후 선택 | {self.collection_remaining}초 남음"
             )
-            self.status.setText(f"COLLECTING {self.collection_label}")
+            self.status.setText("COLLECTING - LABEL AFTER FINISH")
             self.status.setStyleSheet(
                 "background:#175cd3;color:white;padding:18px;border-radius:8px;"
             )
@@ -652,7 +992,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 self.mark_action_cue()
             else:
                 self.collection_status.setText(
-                    f"수집 중: {self.collection_label} | "
+                    "수집 중: 실제 행동은 종료 후 선택 | "
                     f"{max(0, self.collection_remaining)}초 남음"
                 )
 
@@ -665,7 +1005,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             QApplication.beep()
             QTimer.singleShot(200, lambda: QApplication.beep())
             self.collection_status.setText(
-                f"행동 시작 신호 | {self.collection_label} | "
+                "행동 시작 신호 | 실제 행동은 종료 후 선택 | "
                 f"{self.collection_remaining}초 남음"
             )
             self.status.setText("ACTION CUE - MOVE NOW")
@@ -705,16 +1045,53 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 QApplication.beep()
                 QTimer.singleShot(180, lambda: QApplication.beep())
                 QTimer.singleShot(360, lambda: QApplication.beep())
-                reply = QMessageBox.question(
+                default_index = 0
+                if self.collection_planned_label in COLLECTION_LABELS:
+                    default_index = COLLECTION_LABELS.index(
+                        self.collection_planned_label
+                    )
+                actual_label, label_confirmed = QInputDialog.getItem(
                     self,
-                    "수집 유효성 확인",
-                    "이번 회차를 유효한 데이터로 저장할까요?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.Yes,
+                    "실제 행동 확인",
+                    "방금 실제로 수행한 행동을 선택하세요.",
+                    COLLECTION_LABELS,
+                    default_index,
+                    False,
                 )
-                valid = reply == QMessageBox.Yes
-                if not valid:
-                    invalid_reason = "사용자가 수집 후 무효로 표시"
+                decision = finalize_collection_label(
+                    planned_label=self.collection_planned_label,
+                    actual_label=actual_label if label_confirmed else None,
+                    safety_confirmed=self.collection_safety_confirmed is True,
+                )
+                self.collection_label = decision.label
+                self.collection_manifest.update(
+                    {
+                        "label": decision.label,
+                        "labelConfirmedAtEnd": decision.confirmed,
+                        "labelCorrected": decision.corrected,
+                    }
+                )
+                if decision.invalid_reason is not None:
+                    valid = False
+                    invalid_reason = decision.invalid_reason
+                    if show_dialog:
+                        QMessageBox.warning(
+                            self,
+                            "수집 데이터 제외",
+                            f"{decision.invalid_reason}\n\n"
+                            "원본은 보존하지만 학습·내보내기에서는 제외합니다.",
+                        )
+                else:
+                    reply = QMessageBox.question(
+                        self,
+                        "수집 유효성 확인",
+                        "이번 회차를 유효한 데이터로 저장할까요?",
+                        QMessageBox.Yes | QMessageBox.No,
+                        QMessageBox.Yes,
+                    )
+                    valid = reply == QMessageBox.Yes
+                    if not valid:
+                        invalid_reason = "사용자가 수집 후 무효로 표시"
 
             summary = summarize_collection(
                 self.collection_radar_samples, self.collection_link_samples
@@ -751,7 +1128,10 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                     for row in build_profile_feature_rows(
                         self.project_root, self.active_profile["profileId"]
                     )
-                    if row["session_id"] != self.collection_session_id
+                    if not (
+                        row.get("dataset_id") == "native"
+                        and row["session_id"] == self.collection_session_id
+                    )
                 ]
                 known_labels = {str(row["label"]) for row in reference_rows}
                 if self.collection_label not in known_labels:
@@ -806,6 +1186,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             append_profile_session(
                 self.project_root, self.active_profile, self.collection_session_id
             )
+            self.refresh_presence_baseline()
+            self.show_presence(self.presence_detector.reset("warming_up"))
             self.refresh_profile_status()
 
             self.collecting = False
@@ -954,6 +1336,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.set_collection_controls_enabled(True)
             selected = self.selected_scan_channel
             update_profile_channel(self.project_root, self.active_profile, selected)
+            self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("calibration_required"))
             self.refresh_profile_status()
             self.status.setText(
@@ -1074,6 +1457,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 someone_threshold=sample.someone_threshold,
                 move_threshold=sample.move_threshold,
             )
+            self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("warming_up"))
             self.set_collection_controls_enabled(True)
             self.refresh_profile_status()

@@ -7,11 +7,17 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from csi_gateway.cli import build_record, create_session_paths, write_json_line
 from csi_gateway.collection import (
     COLLECTION_LABELS,
+    FALL_LABELS,
     TRANSITION_LABELS,
+    UNLABELED,
+    finalize_collection_label,
     render_korean_summary,
     summarize_collection,
 )
-from csi_gateway.features import extract_session_features
+from csi_gateway.features import (
+    build_current_calibration_presence_rows,
+    extract_session_features,
+)
 from csi_gateway.prototype import REFERENCE_FEATURES, predict_action
 from csi_gateway.radar import (
     CalibrationSample,
@@ -30,7 +36,9 @@ from csi_gateway.profiles import (
     list_profiles,
     load_profile,
     load_or_create_profile,
+    save_profile,
     update_profile_calibration,
+    update_profile_details,
     update_profile_rx_mac,
 )
 
@@ -65,6 +73,52 @@ class CollectorTests(unittest.TestCase):
             self.assertAlmostEqual(features["jitter_mean"], 0.02)
             self.assertEqual(features["moving_ratio"], 0.5)
             self.assertEqual(features["rssi_mean"], -60.0)
+
+    def test_presence_rows_only_use_sessions_after_current_calibration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = create_profile(
+                root,
+                display_name="침실",
+                placement_description="침대 양쪽",
+                distance_meters=1.8,
+                channel=6,
+            )
+            update_profile_calibration(
+                root, profile, someone_threshold=0.1, move_threshold=0.2
+            )
+            profile["calibration"]["calibratedAtUtc"] = "2026-08-11T10:00:00Z"
+            save_profile(root, profile)
+
+            for session_id, started_at in (
+                ("old-empty", "2026-08-11T09:59:00Z"),
+                ("new-empty", "2026-08-11T10:01:00Z"),
+            ):
+                raw_path, manifest_path = create_session_paths(root, session_id)
+                raw_path.write_text(
+                    json.dumps(
+                        {"raw": "RADAR_DADA,1,1,0.3,0,0.1,1,0.01,0,0.2,0"}
+                    ),
+                    encoding="utf-8",
+                )
+                manifest_path.write_text(
+                    json.dumps(
+                        {
+                            "sessionId": session_id,
+                            "profileId": profile["profileId"],
+                            "label": "empty_room",
+                            "valid": True,
+                            "startedAtUtc": started_at,
+                            "rawFile": raw_path.relative_to(root).as_posix(),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            rows = build_current_calibration_presence_rows(
+                root, profile["profileId"]
+            )
+            self.assertEqual([row["session_id"] for row in rows], ["new-empty"])
     def test_fall_and_similar_actions_are_collection_labels(self):
         expected = {
             "sit_down_fast",
@@ -73,6 +127,36 @@ class CollectorTests(unittest.TestCase):
         }
         self.assertTrue(expected.issubset(COLLECTION_LABELS))
         self.assertTrue(expected.issubset(TRANSITION_LABELS))
+
+    def test_collection_label_can_be_confirmed_after_collection(self):
+        decision = finalize_collection_label(
+            planned_label=None,
+            actual_label="lying_static",
+            safety_confirmed=False,
+        )
+        self.assertEqual(decision.label, "lying_static")
+        self.assertTrue(decision.confirmed)
+        self.assertFalse(decision.corrected)
+        self.assertIsNone(decision.invalid_reason)
+
+    def test_cancelled_label_is_unlabeled_and_invalid(self):
+        decision = finalize_collection_label(
+            planned_label="walking_slow",
+            actual_label=None,
+            safety_confirmed=False,
+        )
+        self.assertEqual(decision.label, UNLABELED)
+        self.assertFalse(decision.confirmed)
+        self.assertIsNotNone(decision.invalid_reason)
+
+    def test_fall_label_requires_safety_confirmation_before_collection(self):
+        decision = finalize_collection_label(
+            planned_label=None,
+            actual_label=next(iter(FALL_LABELS)),
+            safety_confirmed=False,
+        )
+        self.assertTrue(decision.confirmed)
+        self.assertIsNotNone(decision.invalid_reason)
 
     def test_record_preserves_unicode_and_replaces_invalid_bytes(self):
         record = build_record(
@@ -172,6 +256,63 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(restored["displayName"], "부모님 집 거실")
             self.assertEqual(restored["radio"]["channel"], 6)
             self.assertTrue(restored["needsCalibration"])
+
+    def test_profile_name_edit_preserves_calibration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = create_profile(
+                root,
+                display_name="침실",
+                placement_description="침대 양쪽",
+                distance_meters=1.8,
+                channel=6,
+            )
+            update_profile_calibration(
+                root, profile, someone_threshold=0.1, move_threshold=0.2
+            )
+            update_profile_details(
+                root,
+                profile,
+                display_name="안방 침실",
+                placement_description="침대 양쪽",
+                distance_meters=1.8,
+                tx_position="사용자가 기록한 위치",
+                rx_position="사용자가 기록한 위치",
+            )
+            restored = load_profile(root, profile["profileId"])
+            self.assertEqual(restored["displayName"], "안방 침실")
+            self.assertFalse(restored["needsCalibration"])
+            self.assertIsNotNone(restored["calibration"])
+
+    def test_profile_placement_edit_invalidates_calibration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = create_profile(
+                root,
+                display_name="침실",
+                placement_description="침대 양쪽",
+                distance_meters=1.8,
+                channel=6,
+            )
+            update_profile_calibration(
+                root, profile, someone_threshold=0.1, move_threshold=0.2
+            )
+            update_profile_details(
+                root,
+                profile,
+                display_name="침실",
+                placement_description="침대 대각선",
+                distance_meters=2.0,
+                tx_position="침대 머리맡 선반 1m",
+                rx_position="침대 발치 선반 0.8m",
+            )
+            restored = load_profile(root, profile["profileId"])
+            self.assertEqual(restored["placement"]["txRxDistanceMeters"], 2.0)
+            self.assertEqual(
+                restored["placement"]["txPosition"], "침대 머리맡 선반 1m"
+            )
+            self.assertTrue(restored["needsCalibration"])
+            self.assertIsNone(restored["calibration"])
 
     def test_new_profile_does_not_record_borrowed_board_macs(self):
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -8,6 +8,9 @@ from time import monotonic
 from .radar import RadarSample
 
 
+STATIC_PRESENCE_LABELS = {"standing_static", "lying_static"}
+
+
 class PresenceState(str, Enum):
     UNKNOWN = "UNKNOWN"
     ABSENT = "ABSENT"
@@ -22,6 +25,52 @@ class PresenceDecision:
     movement_ratio: float
     sample_count: int
     reason: str
+
+
+@dataclass(frozen=True)
+class StaticPresenceBaseline:
+    empty_anchor: float
+    present_anchor: float
+    empty_sessions: int
+    present_sessions: int
+
+    def normalize(self, relative_wander: float) -> float:
+        span = self.present_anchor - self.empty_anchor
+        empty_limit = self.empty_anchor + span * 0.25
+        present_limit = self.present_anchor - span * 0.25
+        return min(
+            1.0,
+            max(0.0, (relative_wander - empty_limit) / (present_limit - empty_limit)),
+        )
+
+
+def build_static_presence_baseline(
+    feature_rows: list[dict[str, object]],
+) -> StaticPresenceBaseline | None:
+    empty_values = [
+        float(row["wander_relative_mean"])
+        for row in feature_rows
+        if row.get("label") == "empty_room"
+    ]
+    present_values = [
+        float(row["wander_relative_mean"])
+        for row in feature_rows
+        if row.get("label") in STATIC_PRESENCE_LABELS
+    ]
+    if not empty_values or not present_values:
+        return None
+
+    empty_anchor = max(empty_values)
+    present_anchor = min(present_values)
+    minimum_gap = max(0.5, empty_anchor * 0.25)
+    if present_anchor - empty_anchor < minimum_gap:
+        return None
+    return StaticPresenceBaseline(
+        empty_anchor=empty_anchor,
+        present_anchor=present_anchor,
+        empty_sessions=len(empty_values),
+        present_sessions=len(present_values),
+    )
 
 
 class PresenceDetector:
@@ -48,6 +97,7 @@ class PresenceDetector:
         presence_confirm_seconds: float = 1.0,
         absence_confirm_seconds: float = 15.0,
         link_timeout_seconds: float = 10.0,
+        static_baseline: StaticPresenceBaseline | None = None,
     ) -> None:
         if window_seconds <= 0:
             raise ValueError("window_seconds must be positive")
@@ -70,8 +120,9 @@ class PresenceDetector:
         self.presence_confirm_seconds = presence_confirm_seconds
         self.absence_confirm_seconds = absence_confirm_seconds
         self.link_timeout_seconds = link_timeout_seconds
+        self.static_baseline = static_baseline
 
-        self._observations: deque[tuple[float, bool, bool]] = deque()
+        self._observations: deque[tuple[float, float, bool]] = deque()
         self._last_observed_at: float | None = None
         self._candidate: str | None = None
         self._candidate_since: float | None = None
@@ -86,6 +137,11 @@ class PresenceDetector:
     @property
     def decision(self) -> PresenceDecision:
         return self._decision
+
+    def set_static_baseline(
+        self, baseline: StaticPresenceBaseline | None
+    ) -> None:
+        self.static_baseline = baseline
 
     def reset(self, reason: str = "waiting_for_samples") -> PresenceDecision:
         self._observations.clear()
@@ -116,8 +172,14 @@ class PresenceDetector:
             raise ValueError("observed_at cannot move backwards")
 
         self._last_observed_at = now
-        occupied = sample.someone or sample.moving
-        self._observations.append((now, occupied, sample.moving))
+        if self.static_baseline is not None and sample.someone_threshold > 0:
+            relative_wander = sample.wander / sample.someone_threshold
+            presence_signal = self.static_baseline.normalize(relative_wander)
+        else:
+            presence_signal = float(sample.someone or sample.moving)
+        if sample.moving:
+            presence_signal = 1.0
+        self._observations.append((now, presence_signal, sample.moving))
         self._prune(now)
         return self._evaluate(now, immediate_movement=sample.moving)
 
@@ -149,8 +211,7 @@ class PresenceDetector:
     ) -> PresenceDecision:
         sample_count = len(self._observations)
         presence_ratio = (
-            sum(float(occupied) for _, occupied, _ in self._observations)
-            / sample_count
+            sum(signal for _, signal, _ in self._observations) / sample_count
         )
         movement_ratio = (
             sum(float(moving) for _, _, moving in self._observations) / sample_count
