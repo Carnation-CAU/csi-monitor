@@ -13,9 +13,10 @@ ESP32-S3 송신기 → ESP32-S3 CSI 수신기 → PC 수집기
 - Windows/macOS 공용 Python CSI 직렬 수집기와 실시간 모니터
 - 버전이 지정된 JSON Lines 원본 저장 형식과 세션 manifest
 - 공간 프로필(배치·채널·보정값) 저장과 복원
+- 팀 ESP-Radar 데이터셋 내보내기·가져오기와 프로필 참고 연결
 - 채널 1·6·11 자동 비교와 빈 공간 보정
-- `someone`·`moving` 기반 실험용 재실·부재 상태 안정화
-- 행동 라벨 안내형 수집과 특징 CSV 생성
+- 공식 `someone`·`moving`과 공간 전용 상대 `wander` 기준을 이용한 실험용 재실·부재 상태 안정화
+- 종료 후 실제 행동을 확정하는 안내형 수집과 특징 CSV 생성
 - ESP-IDF 없이 업로드 가능한 완성 펌웨어 (`firmware/prebuilt`)
 - Espressif `esp-csi` 고정 커밋과 프로젝트 패치
 
@@ -46,7 +47,8 @@ Python은 3.10 이상이면 동작한다. 펌웨어를 직접 빌드할 때만 3
 
 ## 데이터 취급
 
-수집 데이터(`data/raw`, `data/manifests`, `data/processed`)와 공간 프로필(`data/profiles`)은
+수집 데이터(`data/raw`, `data/manifests`, `data/processed`), 공간 프로필(`data/profiles`)과
+가져온·내보낸 데이터셋(`data/datasets`, `data/exports`)은
 방 배치·보드 MAC·생활 패턴 같은 개인 환경 정보를 담으므로 저장소에 올리지 않는다.
 각자 자신의 PC에서 생성해 사용한다.
 
