@@ -26,6 +26,46 @@ TRANSITION_LABELS = {
     "fall_simulated_mattress",
 }
 FALL_LABELS = {"fall_simulated_mattress"}
+UNLABELED = "unlabeled"
+
+
+@dataclass(frozen=True)
+class CollectionLabelDecision:
+    label: str
+    confirmed: bool
+    corrected: bool
+    invalid_reason: str | None
+
+
+def finalize_collection_label(
+    *,
+    planned_label: str | None,
+    actual_label: str | None,
+    safety_confirmed: bool,
+) -> CollectionLabelDecision:
+    """수집 종료 후 실제 행동 라벨과 유효성 정책을 결정한다."""
+    if planned_label is not None and planned_label not in COLLECTION_LABELS:
+        raise ValueError(f"지원하지 않는 예정 라벨: {planned_label}")
+    if actual_label is None:
+        return CollectionLabelDecision(
+            label=UNLABELED,
+            confirmed=False,
+            corrected=False,
+            invalid_reason="실제 행동 라벨 미확정",
+        )
+    if actual_label not in COLLECTION_LABELS:
+        raise ValueError(f"지원하지 않는 실제 라벨: {actual_label}")
+
+    invalid_reason = None
+    if actual_label in FALL_LABELS and not safety_confirmed:
+        invalid_reason = "사전 안전 확인 없이 모의 낙상 라벨 선택"
+
+    return CollectionLabelDecision(
+        label=actual_label,
+        confirmed=True,
+        corrected=planned_label is not None and planned_label != actual_label,
+        invalid_reason=invalid_reason,
+    )
 
 
 @dataclass(frozen=True)

@@ -40,10 +40,14 @@ data/interim/**
 data/manifests/**
 data/processed/**
 data/profiles/**
+data/datasets/**
+data/exports/**
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/manifests/.gitkeep
 !data/processed/.gitkeep
 !data/profiles/.gitkeep
+!data/datasets/.gitkeep
+!data/exports/.gitkeep
 
 third_party/esp-csi/
