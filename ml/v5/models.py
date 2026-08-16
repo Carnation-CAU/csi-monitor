@@ -57,4 +57,14 @@ class CsiResNet18(nn.Module):
 def make_model(name: str, num_classes: int = 3, dropout: float = 0.3) -> nn.Module:
     if name == "simple_cnn": return SimpleCsiCnn(num_classes,dropout)
     if name == "resnet18": return CsiResNet18(num_classes,dropout)
+    if name == "efficientnet_b0":
+        try:
+            from torchvision.models import efficientnet_b0
+        except ImportError as exc:
+            raise RuntimeError("efficientnet_b0 requires torchvision") from exc
+        model=efficientnet_b0(weights=None,dropout=dropout,num_classes=num_classes)
+        first=model.features[0][0]
+        model.features[0][0]=nn.Conv2d(1,first.out_channels,kernel_size=first.kernel_size,
+            stride=first.stride,padding=first.padding,bias=False)
+        return model
     raise ValueError(f"unknown model: {name}")

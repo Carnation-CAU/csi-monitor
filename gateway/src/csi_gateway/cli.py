@@ -148,6 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--port", required=True)
     monitor_parser.add_argument("--baud", type=int, default=2_000_000)
     monitor_parser.add_argument("--project-root", default=".")
+    monitor_parser.add_argument("--activity-model", help="Optional CNN checkpoint (.pt)")
+    monitor_parser.add_argument("--activity-hz", type=float, default=20.0)
+    monitor_parser.add_argument("--activity-window-frames", type=int, default=950)
 
     fall_alert_test_parser = subparsers.add_parser(
         "fall-alert-test", help="Send one test fall event to the app server"
@@ -280,7 +283,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "monitor":
         from .monitor import run_monitor
 
-        return run_monitor(args.port, args.baud, args.project_root)
+        return run_monitor(
+            args.port,
+            args.baud,
+            args.project_root,
+            activity_model=args.activity_model,
+            activity_hz=args.activity_hz,
+            activity_window_frames=args.activity_window_frames,
+        )
     if args.command == "fall-alert-test":
         return send_test_fall_alert(args)
     if args.command == "features":

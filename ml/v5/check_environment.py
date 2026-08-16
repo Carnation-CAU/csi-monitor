@@ -25,6 +25,13 @@ def main():
     from scipy.io import loadmat
     shape=loadmat(files[0])["CSIamp"].shape; print("sample shape:",shape)
     if shape not in {(950,52),(52,950)}: raise SystemExit(f"FAIL: unexpected sample shape {shape}")
+    ut=args.data.parent/"UT-HAR"/"UT_HAR"
+    ut_files=list(ut.glob("data/X_*.csv"))+list(ut.glob("label/y_*.csv"))
+    print("UT-HAR split files:",len(ut_files),"at",ut)
+    if len(ut_files)!=6: raise SystemExit("FAIL: expected 6 UT-HAR split files")
+    csi=args.data.parent/"CSI-HAR-3room"
+    csi_sessions=list(csi.glob("room_*/*/data.csv"))
+    print("CSI-HAR sessions:",len(csi_sessions),"at",csi)
+    if len(csi_sessions)!=10: raise SystemExit("FAIL: expected 10 CSI-HAR sessions")
     print("PASS: environment is ready")
 if __name__=="__main__": main()
-

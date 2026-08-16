@@ -8,15 +8,19 @@ import torch
 from sklearn.metrics import accuracy_score,balanced_accuracy_score,confusion_matrix,f1_score,precision_recall_fscore_support
 from torch import nn
 from torch.utils.data import DataLoader
-from dataset import EspFiDataset,LABEL_NAMES,index_espfi,split_records
-from models import make_model
+try:
+    from .dataset import EspFiDataset,LABEL_NAMES,index_espfi,split_records
+    from .models import make_model
+except ImportError:
+    from dataset import EspFiDataset,LABEL_NAMES,index_espfi,split_records
+    from models import make_model
 
 HERE=Path(__file__).resolve().parent
 DEFAULT_DATA=HERE.parent/"dataset"/"raw"/"ESP-Fi-HAR-full"
 
 def parse_args():
     p=argparse.ArgumentParser()
-    p.add_argument("--model",choices=["simple_cnn","resnet18"],required=True)
+    p.add_argument("--model",choices=["simple_cnn","resnet18","efficientnet_b0"],required=True)
     p.add_argument("--data",type=Path,default=DEFAULT_DATA)
     p.add_argument("--protocol",choices=["participant","environment"],default="participant")
     p.add_argument("--output",type=Path,default=HERE/"output")

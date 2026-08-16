@@ -9,6 +9,7 @@
 - v2: DTW 특징 실험
 - v3: gateway가 자른 실제 이벤트 구간 검증
 - v4: 고전 ML 모델 비교
-- v5: raw CSI 기반 Simple CNN·ResNet18 GPU 학습
+- v5: raw CSI CNN backbone과 단일 split 기준선
+- v5.1: 3개 공개 데이터셋 × 3개 CNN × 4-fold GPU 학습
 
-공개 데이터 현황과 공통 라벨은 [`dataset/README.md`](dataset/README.md), 전체 개발 전략은 [`strategy.md`](strategy.md), 실습실 PC 학습 방법은 [`v5/README.md`](v5/README.md)를 참고한다.
+공개 데이터 현황과 공통 라벨은 [`dataset/README.md`](dataset/README.md), 전체 개발 전략은 [`strategy.md`](strategy.md), 실습실 PC 학습 방법은 [`v5_1/LAB_TRAINING.md`](v5_1/LAB_TRAINING.md)를 참고한다.
