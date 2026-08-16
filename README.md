@@ -14,9 +14,11 @@ ESP32-S3 송신기 → ESP32-S3 CSI 수신기 → PC 수집기
 - 버전이 지정된 JSON Lines 원본 저장 형식과 세션 manifest
 - 공간 프로필(배치·채널·보정값) 저장과 복원
 - 팀 ESP-Radar 데이터셋 내보내기·가져오기와 프로필 참고 연결
-- 채널 1·6·11 자동 비교와 빈 공간 보정
+- 채널 1·6·11 자동 비교 후 선택 채널에서 이어지는 빈 공간 통합 보정
 - 공식 `someone`·`moving`과 공간 전용 상대 `wander` 기준을 이용한 실험용 재실·부재 상태 안정화
 - 종료 후 실제 행동을 확정하는 안내형 수집과 특징 CSV 생성
+- 평상시 움직임·정지 전이와 낙상 의심 이벤트의 날짜별 자동 기록
+- 충격성 변화 후 8초간 회복 움직임이 없을 때 앱 서버로 낙상 의심 이벤트 전송
 - ESP-IDF 없이 업로드 가능한 완성 펌웨어 (`firmware/prebuilt`)
 - Espressif `esp-csi` 고정 커밋과 프로젝트 패치
 
@@ -35,7 +37,8 @@ cd csi-monitor
 Python은 3.10 이상이면 동작한다. 펌웨어를 직접 빌드할 때만 3.12를 권장한다.
 
 그 밖의 절차는 [개발 환경](docs/environment.md), [사용법](docs/usage.md),
-[실험 규약](docs/experiment-protocol.md), [성장 및 추가 개발 로드맵](docs/growth-roadmap.md)을 참고한다.
+[실험 규약](docs/experiment-protocol.md), [ML 학습·시스템 적용 계획](docs/ml-system-integration-plan.md),
+[성장 및 추가 개발 로드맵](docs/growth-roadmap.md)을 참고한다.
 
 ## 펌웨어
 
@@ -47,7 +50,7 @@ Python은 3.10 이상이면 동작한다. 펌웨어를 직접 빌드할 때만 3
 
 ## 데이터 취급
 
-수집 데이터(`data/raw`, `data/manifests`, `data/processed`), 공간 프로필(`data/profiles`)과
+수집·자동 감지 데이터(`data/raw`, `data/manifests`, `data/processed`, `data/events`), 공간 프로필(`data/profiles`)과
 가져온·내보낸 데이터셋(`data/datasets`, `data/exports`)은
 방 배치·보드 MAC·생활 패턴 같은 개인 환경 정보를 담으므로 저장소에 올리지 않는다.
 각자 자신의 PC에서 생성해 사용한다.

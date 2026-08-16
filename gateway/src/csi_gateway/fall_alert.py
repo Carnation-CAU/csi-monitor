@@ -53,25 +53,58 @@ def build_collection_fall_event(
     이 함수의 점수는 모델 확률이 아니다. 현재 수집 테스트 브리지에서는 사용자가
     실제 라벨과 유효성을 확인했다는 사실을 1.0으로 표현한다.
     """
-    if not session_id.strip():
-        raise ValueError("session_id가 비어 있습니다.")
+    return build_detected_fall_event(
+        window_id=session_id,
+        detected_at=detected_at,
+        room_id=room_id,
+        risk_score=1.0,
+        motion_confidence=1.0,
+        presence_state="unknown",
+        presence_probability=0.0,
+        no_recovery_sec=None,
+    )
+
+
+def build_detected_fall_event(
+    *,
+    window_id: str,
+    detected_at: str,
+    room_id: str,
+    risk_score: float,
+    motion_confidence: float,
+    presence_state: str,
+    presence_probability: float,
+    no_recovery_sec: float | None,
+) -> dict[str, Any]:
+    """실시간 감지 결과를 앱의 FallEvent v1.0 계약으로 만든다."""
+    if not window_id.strip():
+        raise ValueError("window_id가 비어 있습니다.")
     if not room_id.strip():
         raise ValueError("room_id가 비어 있습니다.")
     _require_timezone(detected_at)
+    for name, value in (
+        ("risk_score", risk_score),
+        ("motion_confidence", motion_confidence),
+        ("presence_probability", presence_probability),
+    ):
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name}는 0과 1 사이여야 합니다.")
+    if no_recovery_sec is not None and no_recovery_sec < 0:
+        raise ValueError("no_recovery_sec는 0 이상이어야 합니다.")
 
     return {
         "schema_version": "1.0",
         "event_type": "fall_suspected",
-        "window_id": session_id,
+        "window_id": window_id,
         "detected_at": detected_at,
         "room_id": room_id,
-        "risk_score": 1.0,
+        "risk_score": risk_score,
         "evidence": {
             "motion_label": "fall_like",
-            "motion_confidence": 1.0,
-            "presence_state": "unknown",
-            "presence_probability": 0.0,
-            "no_recovery_sec": None,
+            "motion_confidence": motion_confidence,
+            "presence_state": presence_state,
+            "presence_probability": presence_probability,
+            "no_recovery_sec": no_recovery_sec,
         },
     }
 

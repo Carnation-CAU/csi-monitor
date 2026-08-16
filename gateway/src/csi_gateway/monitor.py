@@ -11,6 +11,7 @@ from queue import Empty, Queue
 from time import monotonic
 from uuid import uuid4
 
+from .calibration import render_channel_results, select_best_channel
 from .cli import build_record, create_session_paths, utc_now, write_json_line
 from .collection import (
     COLLECTION_LABELS,
@@ -29,7 +30,13 @@ from .features import (
 from .fall_alert import (
     FallAlertError,
     build_collection_fall_event,
+    build_detected_fall_event,
     send_fall_event,
+)
+from .live_detection import (
+    DetectionEvent,
+    EventJournal,
+    LiveActionDetector,
 )
 from .datasets import (
     DatasetError,
@@ -144,7 +151,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
 
     class FallAlertWorker(QThread):
         delivered = pyqtSignal(str)
-        failed = pyqtSignal(str)
+        failed = pyqtSignal(str, str)
 
         def __init__(self, endpoint: str, event: dict[str, object]) -> None:
             super().__init__()
@@ -155,7 +162,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             try:
                 send_fall_event(self.endpoint, self.event)
             except (FallAlertError, ValueError) as exc:
-                self.failed.emit(str(exc))
+                self.failed.emit(str(self.event["window_id"]), str(exc))
             else:
                 self.delivered.emit(str(self.event["window_id"]))
 
@@ -168,6 +175,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.active_profile = load_or_create_profile(self.project_root)
             self.presence_detector = PresenceDetector()
             self.refresh_presence_baseline()
+            self.event_journal = EventJournal(self.project_root)
+            self.live_detector = self.build_live_detector()
 
             self.jitter_values: deque[float] = deque(maxlen=100)
             self.threshold_values: deque[float] = deque(maxlen=100)
@@ -179,6 +188,9 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.calibrating = False
             self.calibration_stage = ""
             self.calibration_remaining = 0
+            self.calibration_channel: int | None = None
+            self.integrated_calibration = False
+            self.integrated_channel_summary: list[str] = []
             self.current_channel: int | None = None
             self.scanning_channels = False
             self.scan_channels = [1, 6, 11]
@@ -206,6 +218,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_link_samples: list[LinkSample] = []
             self.collection_safety_confirmed: bool | None = None
             self.fall_alert_workers: list[FallAlertWorker] = []
+            self.pending_fall_alerts: dict[str, dict[str, object]] = {}
 
             self.status = QLabel("WAITING FOR RADAR DATA")
             self.status.setAlignment(Qt.AlignCenter)
@@ -221,6 +234,13 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 "background:#b54708;color:white;padding:12px;border-radius:6px;"
             )
 
+            self.action_status = QLabel("자동 행동 감지: 보정 후 자동 시작")
+            self.action_status.setAlignment(Qt.AlignCenter)
+            self.action_status.setFont(QFont("Arial", 13, QFont.Bold))
+            self.action_status.setStyleSheet(
+                "background:#495057;color:white;padding:10px;border-radius:6px;"
+            )
+
             self.details = QLabel(f"Port: {port}  |  Baud: {baud:,}")
             self.details.setFont(QFont("Arial", 12))
 
@@ -233,11 +253,9 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.channel_status = QLabel("Wi-Fi channel: checking...")
             self.channel_status.setFont(QFont("Arial", 12, QFont.Bold))
 
-            self.calibrate_button = QPushButton("Calibrate Empty Room (40 seconds)")
-            self.calibrate_button.setFont(QFont("Arial", 12, QFont.Bold))
-            self.calibrate_button.clicked.connect(self.start_calibration)
-
-            self.channel_scan_button = QPushButton("Find Best Channel (1, 6, 11)")
+            self.channel_scan_button = QPushButton(
+                "채널 + 공간 통합 보정 (약 100초)"
+            )
             self.channel_scan_button.setFont(QFont("Arial", 12, QFont.Bold))
             self.channel_scan_button.clicked.connect(self.start_channel_scan)
 
@@ -380,12 +398,12 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             layout = QVBoxLayout()
             layout.addWidget(self.status)
             layout.addWidget(self.presence_status)
+            layout.addWidget(self.action_status)
             layout.addWidget(self.link_status)
             layout.addWidget(self.channel_status)
             layout.addWidget(self.details)
             button_layout = QHBoxLayout()
             button_layout.addWidget(self.channel_scan_button)
-            button_layout.addWidget(self.calibrate_button)
             layout.addLayout(button_layout)
             layout.addWidget(profile_group)
             layout.addWidget(dataset_group)
@@ -446,6 +464,14 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.presence_detector.set_static_baseline(
                 build_static_presence_baseline(rows)
             )
+            if hasattr(self, "live_detector"):
+                self.live_detector = self.build_live_detector()
+
+        def build_live_detector(self) -> LiveActionDetector:
+            # 공개 데이터 모델은 아직 운영 성능이 검증되지 않았다. 지금은 공식
+            # Radar moving 신호를 안정화하고, 후속 ML은 detector의 classifier
+            # 주입 계약으로 교체한다.
+            return LiveActionDetector()
 
         def refresh_profile_list(self, selected_profile_id: str) -> None:
             self.profile_combo.blockSignals(True)
@@ -878,7 +904,6 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.fall_alert_endpoint.setEnabled(enabled)
             self.fall_alert_test_button.setEnabled(enabled)
             self.channel_scan_button.setEnabled(enabled)
-            self.calibrate_button.setEnabled(enabled)
             self.profile_combo.setEnabled(enabled)
             self.profile_add_button.setEnabled(enabled)
             self.profile_edit_button.setEnabled(enabled)
@@ -1279,6 +1304,59 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             )
             self.start_fall_alert_delivery(endpoint, event, "모의 낙상 수집 완료")
 
+        def handle_live_detection(self, event: DetectionEvent) -> None:
+            record = {
+                "schema_version": "1.0",
+                **event.to_record(),
+                "profile_id": self.active_profile["profileId"],
+                "room_id": self.active_profile["roomId"],
+                "device_id": "rx-s3-001",
+                "channel": self.current_channel,
+            }
+            event_path = self.event_journal.append(record)
+            labels = {
+                "moving": "움직임",
+                "static": "정지",
+                "fall_like": "낙상 의심",
+            }
+            label = labels.get(event.label, event.label)
+            self.action_status.setText(
+                f"자동 행동 감지: {label} | 신뢰 지표 {event.confidence * 100:.0f}% | "
+                f"기록 {event_path.name}"
+            )
+            if event.event_type != "fall_suspected":
+                self.action_status.setStyleSheet(
+                    "background:#175cd3;color:white;padding:10px;border-radius:6px;"
+                )
+                return
+
+            self.action_status.setStyleSheet(
+                "background:#b42318;color:white;padding:10px;border-radius:6px;"
+            )
+            evidence = event.evidence
+            app_event = build_detected_fall_event(
+                window_id=event.event_id,
+                detected_at=event.detected_at,
+                room_id=str(self.active_profile["roomId"]),
+                risk_score=event.confidence,
+                motion_confidence=event.confidence,
+                presence_state=str(evidence["presence_state"]),
+                presence_probability=float(evidence["presence_probability"]),
+                no_recovery_sec=float(evidence["no_recovery_sec"]),
+            )
+            endpoint = self.fall_alert_endpoint.text().strip()
+            if not endpoint:
+                self.record_alert_delivery(
+                    app_event,
+                    status="skipped",
+                    message="앱 서버 주소 미설정",
+                )
+                self.action_status.setText(
+                    "자동 행동 감지: 낙상 의심 기록 완료 | 앱 서버 주소가 없어 알림 미전송"
+                )
+                return
+            self.start_fall_alert_delivery(endpoint, app_event, "자동 낙상 의심 감지")
+
         def send_manual_fall_alert_test(self) -> None:
             endpoint = self.fall_alert_endpoint.text().strip()
             if not endpoint:
@@ -1305,13 +1383,38 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
         ) -> None:
             worker = FallAlertWorker(endpoint, event)
             self.fall_alert_workers.append(worker)
+            self.pending_fall_alerts[str(event["window_id"])] = event
+            self.record_alert_delivery(event, status="sending")
             worker.delivered.connect(self.fall_alert_delivered)
             worker.failed.connect(self.fall_alert_failed)
             worker.finished.connect(lambda: self.release_fall_alert_worker(worker))
             self.collection_status.setText(
                 f"{status_prefix} | 앱 알림 전송 중: {event['window_id']}"
             )
+            self.action_status.setText(
+                f"{status_prefix} | 앱 알림 전송 중: {event['window_id']}"
+            )
             worker.start()
+
+        def record_alert_delivery(
+            self,
+            event: dict[str, object],
+            *,
+            status: str,
+            message: str | None = None,
+        ) -> None:
+            self.event_journal.append(
+                {
+                    "schema_version": "1.0",
+                    "event_type": "fall_alert_delivery",
+                    "window_id": event["window_id"],
+                    "detected_at": event["detected_at"],
+                    "recorded_at": utc_now(),
+                    "room_id": event["room_id"],
+                    "status": status,
+                    "message": message,
+                }
+            )
 
         def release_fall_alert_worker(self, worker: FallAlertWorker) -> None:
             if worker in self.fall_alert_workers:
@@ -1319,7 +1422,13 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             worker.deleteLater()
 
         def fall_alert_delivered(self, window_id: str) -> None:
+            event = self.pending_fall_alerts.pop(window_id, None)
+            if event is not None:
+                self.record_alert_delivery(event, status="delivered")
             self.collection_status.setText(
+                f"낙상 의심 알림 전송 완료 | window_id: {window_id}"
+            )
+            self.action_status.setText(
                 f"낙상 의심 알림 전송 완료 | window_id: {window_id}"
             )
             QMessageBox.information(
@@ -1328,28 +1437,36 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 f"앱 서버가 이벤트를 접수했습니다.\nwindow_id: {window_id}",
             )
 
-        def fall_alert_failed(self, message: str) -> None:
+        def fall_alert_failed(self, window_id: str, message: str) -> None:
+            failed_event = self.pending_fall_alerts.pop(window_id, None)
+            if failed_event is not None:
+                self.record_alert_delivery(
+                    failed_event,
+                    status="failed",
+                    message=message,
+                )
             self.collection_status.setText("낙상 의심 알림 전송 실패")
+            self.action_status.setText("낙상 의심 알림 전송 실패 | 기록 저장됨")
             QMessageBox.warning(self, "낙상 의심 알림 전송 실패", message)
 
         def start_channel_scan(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
             reply = QMessageBox.question(
                 self,
-                "Channel comparison",
-                "Keep the room empty or completely still for about 65 seconds. "
-                "Channels 1, 6, and 11 will be tested, and the strongest stable channel "
-                "will be selected. Empty-room calibration must be run afterward.",
+                "채널 + 공간 통합 보정",
+                "약 100초 동안 채널 1·6·11을 비교한 뒤 선택 채널에서 "
+                "빈 공간 보정까지 자동으로 진행합니다.\n\n"
+                "10초 안에 방을 나간 뒤 완료 안내가 나올 때까지 방을 비우고, "
+                "보드·문·가구를 움직이지 않겠습니까?",
                 QMessageBox.Yes | QMessageBox.Cancel,
                 QMessageBox.Yes,
             )
             if reply != QMessageBox.Yes:
                 return
 
-            channel = self.current_channel or int(
-                self.active_profile["radio"]["channel"]
-            )
-            update_profile_channel(self.project_root, self.active_profile, channel)
-            self.refresh_profile_status()
+            self.integrated_calibration = True
+            self.integrated_channel_summary.clear()
             self.scanning_channels = True
             self.show_presence(self.presence_detector.reset("measurement_in_progress"))
             self.scan_index = 0
@@ -1357,7 +1474,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.scan_deadline = monotonic() + 10
             self.scan_results.clear()
             self.set_collection_controls_enabled(False)
-            self.status.setText("LEAVE OR STAY COMPLETELY STILL - 10 seconds")
+            self.status.setText("통합 보정 준비 - 10초 안에 방을 비워 주세요")
             self.status.setStyleSheet(
                 "background:#b54708;color:white;padding:18px;border-radius:8px;"
             )
@@ -1424,28 +1541,13 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 self.complete_channel_scan()
 
         def finish_channel_scan(self) -> None:
-            valid = {
-                channel: result
-                for channel, result in self.scan_results.items()
-                if result["samples"] >= 5
-            }
-            if not valid:
+            selected = select_best_channel(self.scan_results)
+            if selected is None:
                 self.abort_channel_scan(
                     "No channel produced enough link data. Press RST on both boards; "
                     "they will return to channel 6."
                 )
                 return
-
-            selected = max(
-                valid,
-                key=lambda channel: (
-                    valid[channel]["max_gap"] < 10,
-                    valid[channel]["min_hz"],
-                    valid[channel]["avg_hz"],
-                    -valid[channel]["max_gap"],
-                    valid[channel]["avg_rssi"],
-                ),
-            )
             self.selected_scan_channel = selected
             self.reader.send_command(f"rf_channel --set {selected}")
             self.scan_phase = "finalizing"
@@ -1456,37 +1558,25 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.channel_scan_timer.stop()
             self.scanning_channels = False
             self.scan_phase = ""
-            self.set_collection_controls_enabled(True)
             selected = self.selected_scan_channel
-            update_profile_channel(self.project_root, self.active_profile, selected)
-            self.refresh_presence_baseline()
-            self.show_presence(self.presence_detector.reset("calibration_required"))
-            self.refresh_profile_status()
+            self.integrated_channel_summary = render_channel_results(
+                self.scan_channels, self.scan_results
+            )
             self.status.setText(
-                f"CHANNEL {selected} SELECTED - CALIBRATE EMPTY ROOM"
+                f"채널 {selected} 선택 완료 - 빈 공간 보정을 시작합니다"
             )
-            self.status.setStyleSheet(
-                "background:#175cd3;color:white;padding:18px;border-radius:8px;"
-            )
-            rows = []
-            for channel in self.scan_channels:
-                result = self.scan_results[channel]
-                rows.append(
-                    f"CH {channel}: avg {result['avg_hz']:.1f} Hz, "
-                    f"min {result['min_hz']:.0f} Hz, RSSI {result['avg_rssi']:.1f} dBm, "
-                    f"max gap {result['max_gap']:.1f}s"
-                )
-            QMessageBox.information(
-                self,
-                "Channel selected",
-                "\n".join(rows)
-                + f"\n\nChannel {selected} was selected. Now run empty-room calibration.",
+            self.begin_empty_room_calibration(
+                delay_seconds=0,
+                channel=selected,
+                integrated=True,
             )
 
         def abort_channel_scan(self, message: str) -> None:
             self.channel_scan_timer.stop()
             self.scanning_channels = False
             self.scan_phase = ""
+            self.integrated_calibration = False
+            self.integrated_channel_summary.clear()
             self.show_presence(self.presence_detector.reset("measurement_failed"))
             self.set_collection_controls_enabled(True)
             self.status.setText("CHANNEL COMPARISON FAILED")
@@ -1496,6 +1586,11 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             QMessageBox.warning(self, "Channel comparison failed", message)
 
         def start_calibration(self) -> None:
+            """개발용 단독 빈 공간 보정 진입점.
+
+            기본 GUI는 통합 보정을 사용하지만 저장 채널에서 보정만 다시 시험할 때
+            재사용할 수 있도록 내부 진입점은 유지한다.
+            """
             reply = QMessageBox.question(
                 self,
                 "Empty-room calibration",
@@ -1507,24 +1602,51 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             if reply != QMessageBox.Yes:
                 return
 
-            channel = self.current_channel or int(
+            self.integrated_calibration = False
+            self.integrated_channel_summary.clear()
+            self.begin_empty_room_calibration(delay_seconds=10, integrated=False)
+
+        def begin_empty_room_calibration(
+            self,
+            *,
+            delay_seconds: int,
+            channel: int | None = None,
+            integrated: bool,
+        ) -> None:
+            selected_channel = channel or self.current_channel or int(
                 self.active_profile["radio"]["channel"]
             )
-            update_profile_channel(self.project_root, self.active_profile, channel)
+            update_profile_channel(
+                self.project_root, self.active_profile, selected_channel
+            )
+            self.refresh_presence_baseline()
             self.refresh_profile_status()
+            self.integrated_calibration = integrated
+            self.calibration_channel = selected_channel
             self.calibrating = True
             self.show_presence(self.presence_detector.reset("calibrating"))
-            self.calibration_stage = "delay"
-            self.calibration_remaining = 10
             self.set_collection_controls_enabled(False)
-            self.status.setText("LEAVE THE AREA - 10 seconds")
-            self.status.setStyleSheet(
-                "background:#b54708;color:white;padding:18px;border-radius:8px;"
-            )
             self.jitter_values.clear()
             self.threshold_values.clear()
             self.jitter_curve.clear()
             self.threshold_curve.clear()
+
+            if delay_seconds > 0:
+                self.calibration_stage = "delay"
+                self.calibration_remaining = delay_seconds
+                self.status.setText(
+                    f"LEAVE THE AREA - {self.calibration_remaining} seconds"
+                )
+            else:
+                self.reader.send_command("radar --train_start")
+                self.calibration_stage = "training"
+                self.calibration_remaining = 30
+                self.status.setText(
+                    f"채널 {selected_channel} 빈 공간 보정 중 - 30초"
+                )
+            self.status.setStyleSheet(
+                "background:#b54708;color:white;padding:18px;border-radius:8px;"
+            )
             self.calibration_timer.start()
 
         def calibration_tick(self) -> None:
@@ -1545,14 +1667,25 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 if self.calibration_remaining > 0:
                     self.status.setText("보정 결과를 기다리는 중입니다")
                     return
+                was_integrated = self.integrated_calibration
                 self.calibration_timer.stop()
                 self.calibrating = False
                 self.calibration_stage = ""
+                self.calibration_channel = None
+                self.integrated_calibration = False
+                self.integrated_channel_summary.clear()
                 self.set_collection_controls_enabled(True)
                 self.status.setText("보정 결과 저장 실패 - 다시 보정해 주세요")
                 self.status.setStyleSheet(
                     "background:#b42318;color:white;padding:18px;border-radius:8px;"
                 )
+                if was_integrated:
+                    QMessageBox.warning(
+                        self,
+                        "통합 보정 실패",
+                        "채널은 선택해 저장했지만 빈 공간 보정 결과를 받지 못했습니다.\n"
+                        "보드 연결을 확인한 뒤 통합 보정을 다시 실행해 주세요.",
+                    )
                 return
 
             if self.calibration_remaining > 0:
@@ -1569,11 +1702,16 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
         def update_calibration_result(self, sample: CalibrationSample) -> None:
             if not self.calibrating or self.calibration_stage != "waiting_result":
                 return
+            was_integrated = self.integrated_calibration
+            channel_summary = list(self.integrated_channel_summary)
             self.calibration_timer.stop()
             self.calibrating = False
             self.calibration_stage = ""
-            if self.current_channel is not None:
-                self.active_profile["radio"]["channel"] = self.current_channel
+            self.integrated_calibration = False
+            self.integrated_channel_summary.clear()
+            if self.calibration_channel is not None:
+                self.active_profile["radio"]["channel"] = self.calibration_channel
+            self.calibration_channel = None
             update_profile_calibration(
                 self.project_root,
                 self.active_profile,
@@ -1584,14 +1722,27 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.show_presence(self.presence_detector.reset("warming_up"))
             self.set_collection_controls_enabled(True)
             self.refresh_profile_status()
-            self.status.setText("CALIBRATION COMPLETE - PROFILE SAVED")
+            self.status.setText(
+                "통합 보정 완료 - 프로필 저장됨"
+                if was_integrated
+                else "CALIBRATION COMPLETE - PROFILE SAVED"
+            )
             self.status.setStyleSheet(
                 "background:#175cd3;color:white;padding:18px;border-radius:8px;"
             )
             QMessageBox.information(
                 self,
-                "보정 및 프로필 저장 완료",
-                f"{self.active_profile['displayName']} 프로필에 채널과 보정값을 저장했습니다.",
+                "채널 + 공간 통합 보정 완료"
+                if was_integrated
+                else "보정 및 프로필 저장 완료",
+                (
+                    ("\n".join(channel_summary) + "\n\n")
+                    if channel_summary
+                    else ""
+                )
+                + f"선택 채널: {self.active_profile['radio']['channel']}\n"
+                + f"{self.active_profile['displayName']} 프로필에 채널과 빈 공간 "
+                "보정값을 함께 저장했습니다.",
             )
 
         def update_device_mac(self, sample: DeviceMacSample) -> None:
@@ -1637,6 +1788,30 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                     observed_at=now,
                 )
             self.show_presence(presence)
+
+            if self.scanning_channels or self.calibrating or self.collecting:
+                self.live_detector.reset()
+                self.action_status.setText("자동 행동 감지: 측정·수집 중 일시 정지")
+            elif not self.is_presence_calibrated():
+                self.live_detector.reset()
+                self.action_status.setText("자동 행동 감지: 빈 공간 보정 필요")
+            else:
+                presence_state = (
+                    "present"
+                    if presence.state
+                    in {PresenceState.PRESENT_ACTIVE, PresenceState.PRESENT_STATIC}
+                    else "absent"
+                    if presence.state == PresenceState.ABSENT
+                    else "unknown"
+                )
+                for detected_event in self.live_detector.update(
+                    sample,
+                    observed_at=now,
+                    detected_at=utc_now(),
+                    presence_state=presence_state,
+                    presence_probability=presence.presence_ratio,
+                ):
+                    self.handle_live_detection(detected_event)
 
             if self.scanning_channels or self.collecting:
                 pass
@@ -1711,6 +1886,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 )
 
         def show_error(self, message: str) -> None:
+            self.live_detector.reset()
+            self.action_status.setText("자동 행동 감지: 직렬 통신 오류로 중지")
             self.show_presence(self.presence_detector.reset("serial_error"))
             self.status.setText("SERIAL ERROR")
             self.status.setStyleSheet(
