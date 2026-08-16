@@ -66,7 +66,12 @@ if ($LASTEXITCODE -ne 0) {
 if ($LASTEXITCODE -ne 0) {
     throw "프로젝트 의존성 설치에 실패했습니다."
 }
+& $VenvPython -m pip install esptool
+if ($LASTEXITCODE -ne 0) {
+    throw "펌웨어 업로드 도구(esptool) 설치에 실패했습니다."
+}
 
 Write-Host "기본 Python 환경 구성이 완료되었습니다."
 Write-Host "활성화 파일은 .venv\Scripts 또는 .venv\bin 아래에 있습니다."
 Write-Host "포트 확인: python -m csi_gateway ports"
+Write-Host "Windows 사용법: docs\usage-windows.md"

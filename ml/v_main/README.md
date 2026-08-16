@@ -16,6 +16,7 @@ ml/v_main/
 - 모델: EfficientNet-B0
 - 학습 데이터: ESP-Fi HAR
 - 입력: 최근 950프레임 × 52개 subcarrier amplitude
+- 배포 무선 입력: ESP32-S3, HT20, LLTF, raw I/Q 길이 104
 - 클래스: fall / walking / other_motion
 - 외부 라벨: fall은 `fall_suspected`로 반환
 - 모델 버전: `v5.1-efficientnet-b0-espfi-cv-fold1-20260816`
@@ -25,6 +26,32 @@ v5.1 4-fold 평균 test macro-F1이 가장 높은 ESP-Fi 모델을 선택했다.
 checkpoint는 test fold가 아니라 validation macro-F1이 가장 높은 fold 1을
 사용했다. 이 checkpoint는 공개 데이터 기반 시스템 통합 후보이며, 자체
 ESP32-S3 locked test를 통과한 최종 안전 모델은 아니다.
+
+### raw CSI가 모델까지 가는 방식
+
+모니터가 시리얼의 원본 `CSI_DATA` 문자열을 읽지만 그 문자열 전체가 PyTorch
+모델의 입력은 아니다.
+
+```text
+CSI_DATA 문자열
+→ 104개 raw I/Q 정수 파싱
+→ 52개 (I,Q) 쌍
+→ sqrt(I² + Q²) amplitude 52개
+→ 최근 950프레임 적재
+→ subcarrier별 window z-score
+→ float32[1, 1, 950, 52]
+→ model.pt
+```
+
+따라서 현재 모델은 phase, RSSI, noise floor, timestamp와 그 밖의 CSI metadata를
+사용하지 않는다. 원본 문자열은 수집 JSONL에 그대로 보존되고 모델에는 amplitude만
+전달된다.
+
+현재 HT20 LLTF 펌웨어는 한 프레임을 104개 I/Q 정수, 즉 52개 amplitude로 만들어
+모델 입력 shape와 직접 맞는다. 이전 HT40 설정보다 검증 조건을 명확하게 맞추지만,
+이것만으로 정확도 향상을 보장하지는 않는다. 모델 학습 데이터는 ESP32-C3 기반이고
+실제 입력은 ESP32-S3이며 공간·배치·안테나·채널 차이도 남아 있으므로, 같은 HT20
+설정의 자체 S3 데이터로 locked test를 해야 실제 정확도를 판단할 수 있다.
 
 ## Monitor에서 호출
 
@@ -49,8 +76,9 @@ macOS:
 - gateway는 최근 950프레임이 쌓이고 `moving=true`일 때 background worker로
   모델을 호출하며, 움직임 종료 후 3초까지 tail window를 판단한다.
 - checkpoint의 입력 크기를 직접 읽으므로 실행 인자로 950을 다시 지정하지 않는다.
-- 모델이 정상 로드되면 gateway가 RX에 LLFT decimal 원시 CSI 출력을 자동으로
-  요청한다. 공식 GUI에서 raw display를 별도로 켜지 않는다.
+- 모델이 정상 로드되면 gateway가 RX에 LLTF decimal 원시 CSI 출력을 자동으로
+  요청한다. 펌웨어 명령 인자의 철자만 `LLFT`다. 공식 GUI에서 raw display를
+  별도로 켜지 않는다.
 
 모델 로드 시 `MODEL_SPEC.json`의 SHA-256, 입력 크기, 라벨, architecture와 모델
 버전을 검증한다. Windows NVIDIA에서는 CUDA, Apple Silicon에서는 MPS, 그 밖의

@@ -7,6 +7,7 @@ from csi_gateway.live_detection import (
     EventJournal,
     LiveActionDetector,
     LiveDetectionConfig,
+    format_fall_history_record,
 )
 from csi_gateway.radar import RadarSample
 
@@ -139,6 +140,64 @@ class EventJournalTests(unittest.TestCase):
             self.assertEqual(path.name, "2026-08-16.jsonl")
             record = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(record["label"], "움직임")
+
+    def test_recent_fall_records_filters_and_returns_newest_first(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            journal = EventJournal(Path(temp_dir))
+            journal.append(
+                {
+                    "event_type": "activity_detected",
+                    "detected_at": "2026-08-16T12:00:00+09:00",
+                }
+            )
+            journal.append(
+                {
+                    "event_type": "ml_fall_candidate",
+                    "detected_at": "2026-08-16T12:01:00+09:00",
+                    "event_id": "ml-1",
+                    "confidence": 0.91,
+                    "source": "cnn_activity_model",
+                }
+            )
+            journal.append(
+                {
+                    "event_type": "fall_alert_delivery",
+                    "detected_at": "2026-08-16T12:01:00+09:00",
+                    "recorded_at": "2026-08-16T12:01:01+09:00",
+                    "window_id": "ml-1",
+                    "status": "skipped",
+                }
+            )
+
+            records = journal.recent_fall_records(limit=2)
+
+            self.assertEqual(
+                [record["event_type"] for record in records],
+                ["fall_alert_delivery", "ml_fall_candidate"],
+            )
+
+    def test_formats_fall_history_with_time_score_and_evidence(self):
+        line = format_fall_history_record(
+            {
+                "event_type": "fall_suspected",
+                "detected_at": "2026-08-16T12:01:00+09:00",
+                "event_id": "fall-1",
+                "confidence": 0.87,
+                "source": "ml_radar_fusion",
+                "evidence": {
+                    "impact_ratio": 3.2,
+                    "no_recovery_sec": 8.0,
+                    "ml_fall_score_max": 0.93,
+                },
+            }
+        )
+
+        self.assertIn("최종 낙상 의심", line)
+        self.assertIn("신뢰 지표 87.0%", line)
+        self.assertIn("충격비 3.20", line)
+        self.assertIn("무회복 8.0초", line)
+        self.assertIn("ML 93.0%", line)
+        self.assertIn("ID fall-1", line)
 
 
 if __name__ == "__main__":

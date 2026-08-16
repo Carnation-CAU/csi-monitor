@@ -3,5 +3,12 @@
   "espIdf": "v5.0.2",
   "espIdfPathWindowsDefault": "%USERPROFILE%/esp/esp-idf-v5.0.2",
   "espCsiCommit": "740083e5ac0067b8e5ba812d2d08fd94f8ce0348",
-  "python": "3.12.10"
+  "python": "3.12",
+  "firmwareTarget": "esp32s3",
+  "wifiBandwidth": "HT20",
+  "defaultWifiChannel": 6,
+  "runtimeWifiChannels": [1, 6, 11],
+  "csiLtf": "LLTF",
+  "txFrequencyHz": 100,
+  "serialBaud": 2000000
 }

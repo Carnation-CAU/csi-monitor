@@ -36,7 +36,9 @@ from .fall_alert import (
 from .live_detection import (
     DetectionEvent,
     EventJournal,
+    FALL_HISTORY_EVENT_TYPES,
     LiveActionDetector,
+    format_fall_history_record,
 )
 from .datasets import (
     DatasetError,
@@ -77,7 +79,11 @@ from .radar import (
     parse_radar_line,
 )
 from .prototype import predict_action
-from .activity import ActivityFrame, AsyncFrameWindowEngine
+from .activity import (
+    ActivityFrame,
+    ActivityPredictionDisplaySmoother,
+    AsyncFrameWindowEngine,
+)
 from .activity_events import ActivityEventAggregator
 from .csi import RAW_CSI_ENABLE_COMMAND, parse_csi_line
 
@@ -107,6 +113,7 @@ def run_monitor(
         QMessageBox,
         QInputDialog,
         QPushButton,
+        QPlainTextEdit,
         QHBoxLayout,
         QSpinBox,
         QVBoxLayout,
@@ -211,6 +218,11 @@ def run_monitor(
             self.activity_model_device = ""
             self.csi_frame_count = 0
             self.last_csi_at = 0.0
+            self.activity_display = ActivityPredictionDisplaySmoother(
+                history_size=5,
+                refresh_seconds=1.0,
+            )
+            self.has_activity_prediction = False
             if activity_model:
                 try:
                     if str(self.project_root) not in sys.path:
@@ -295,13 +307,24 @@ def run_monitor(
                 "background:#495057;color:white;padding:10px;border-radius:6px;"
             )
 
+            self.fall_history = QPlainTextEdit()
+            self.fall_history.setReadOnly(True)
+            self.fall_history.setMaximumBlockCount(100)
+            self.fall_history.setMaximumHeight(145)
+            self.fall_history.setPlaceholderText("아직 기록된 낙상 후보가 없습니다.")
+            fall_history_layout = QVBoxLayout()
+            fall_history_layout.addWidget(self.fall_history)
+            fall_history_group = QGroupBox("최근 낙상 후보·감지 기록 (최신순)")
+            fall_history_group.setLayout(fall_history_layout)
+            self.refresh_fall_history()
+
             if self.activity_model_error:
                 activity_text = f"행동 분류: 모델 사용 불가 · {self.activity_model_error}"
             elif self.activity_engine is None:
                 activity_text = "행동 분류: 모델 미설정 · Radar 감지만 사용"
             else:
                 activity_text = (
-                    "행동 분류: 원시 CSI 대기 · LLFT 자동 활성화 · "
+                    "행동 분류: 원시 CSI 대기 · LLTF 자동 활성화 · "
                     f"{self.activity_model_device}"
                 )
             self.activity_status = QLabel(activity_text)
@@ -470,6 +493,7 @@ def run_monitor(
             layout.addWidget(self.presence_status)
             layout.addWidget(self.action_status)
             layout.addWidget(self.activity_status)
+            layout.addWidget(fall_history_group)
             layout.addWidget(self.link_status)
             layout.addWidget(self.channel_status)
             layout.addWidget(self.details)
@@ -1182,8 +1206,16 @@ def run_monitor(
             suspended = self.scanning_channels or self.calibrating or self.collecting
             if suspended:
                 self.activity_engine.deactivate(clear_frames=True)
+                self.activity_display.reset()
+                self.has_activity_prediction = False
                 if self.activity_aggregator is not None:
                     self.activity_aggregator.reset()
+                paused_text = "행동 분류: 보정·수집 중 일시 정지"
+                if self.activity_status.text() != paused_text:
+                    self.activity_status.setText(paused_text)
+                    self.activity_status.setStyleSheet(
+                        "background:#495057;color:white;padding:10px;border-radius:6px;"
+                    )
                 return
             self.activity_engine.submit(
                 ActivityFrame(sample.sequence, sample.timestamp, sample.amplitude),
@@ -1214,7 +1246,7 @@ def run_monitor(
                         self.handle_live_detection(event)
                 if self.csi_frame_count == 0:
                     self.activity_status.setText(
-                        "행동 분류: 원시 CSI 대기 · LLFT 자동 활성화 명령 전송됨"
+                        "행동 분류: 원시 CSI 대기 · LLTF 자동 활성화 명령 전송됨"
                     )
                     self.activity_status.setStyleSheet(
                         "background:#495057;color:white;padding:10px;border-radius:6px;"
@@ -1232,7 +1264,17 @@ def run_monitor(
                     self.activity_status.setStyleSheet(
                         "background:#495057;color:white;padding:10px;border-radius:6px;"
                     )
+                elif self.has_activity_prediction and self.activity_display.is_fresh(
+                    now=now,
+                    hold_seconds=5.0,
+                ):
+                    # Keep a recent stable result visible without presenting
+                    # an old action as the current classification forever.
+                    return
                 else:
+                    if self.has_activity_prediction:
+                        self.activity_display.reset()
+                        self.has_activity_prediction = False
                     self.activity_status.setText(
                         "행동 분류: 모델 준비됨 · Radar 움직임 대기"
                     )
@@ -1240,10 +1282,6 @@ def run_monitor(
                         "background:#087f3d;color:white;padding:10px;border-radius:6px;"
                     )
                 return
-            scores = " · ".join(f"{name} {value * 100:.0f}%" for name,value in prediction.scores.items())
-            self.activity_status.setText(f"행동 분류: {prediction.label} · {scores}")
-            color = "#b42318" if prediction.label == "fall_suspected" else "#175cd3"
-            self.activity_status.setStyleSheet(f"background:{color};color:white;padding:10px;border-radius:6px;")
             if self.activity_aggregator is not None:
                 for event in self.activity_aggregator.observe(
                     prediction,
@@ -1251,6 +1289,22 @@ def run_monitor(
                     detected_at=utc_now(),
                 ):
                     self.handle_live_detection(event)
+            display = self.activity_display.observe(prediction, now=now)
+            if display is None:
+                return
+            label, averaged_scores = display
+            scores = " · ".join(
+                f"{name} {value * 100:.0f}%"
+                for name, value in averaged_scores.items()
+            )
+            self.has_activity_prediction = True
+            self.activity_status.setText(
+                f"행동 분류(최근 5회 평균 · 5초 유지): {label} · {scores}"
+            )
+            color = "#b42318" if label == "fall_suspected" else "#175cd3"
+            self.activity_status.setStyleSheet(
+                f"background:{color};color:white;padding:10px;border-radius:6px;"
+            )
 
         def finish_collection(
             self,
@@ -1470,6 +1524,8 @@ def run_monitor(
                 "channel": self.current_channel,
             }
             event_path = self.event_journal.append(record)
+            if event.event_type in FALL_HISTORY_EVENT_TYPES:
+                self.refresh_fall_history()
             labels = {
                 "moving": "움직임",
                 "static": "정지",
@@ -1570,6 +1626,13 @@ def run_monitor(
                     "status": status,
                     "message": message,
                 }
+            )
+            self.refresh_fall_history()
+
+        def refresh_fall_history(self) -> None:
+            records = self.event_journal.recent_fall_records(limit=20)
+            self.fall_history.setPlainText(
+                "\n".join(format_fall_history_record(record) for record in records)
             )
 
         def release_fall_alert_worker(self, worker: FallAlertWorker) -> None:
@@ -2019,7 +2082,7 @@ def run_monitor(
         def update_channel(self, sample: ChannelSample) -> None:
             self.current_channel = sample.channel
             self.channel_status.setText(
-                f"Current Wi-Fi channel: {sample.channel}  |  Bandwidth: HT40"
+                f"Current Wi-Fi channel: {sample.channel}  |  Bandwidth: HT20"
             )
 
         def show_link(self, sample: LinkSample) -> None:

@@ -226,6 +226,7 @@ class CollectorTests(unittest.TestCase):
             root = Path(temp_dir)
             profile = load_or_create_profile(root)
             self.assertTrue(profile["needsCalibration"])
+            self.assertEqual(profile["radio"]["bandwidth"], "HT20")
             update_profile_calibration(
                 root,
                 profile,
@@ -253,6 +254,7 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(len(profiles), 2)
             self.assertNotEqual(first["profileId"], second["profileId"])
             restored = load_profile(root, second["profileId"])
+            self.assertEqual(restored["radio"]["bandwidth"], "HT20")
             self.assertEqual(restored["displayName"], "부모님 집 거실")
             self.assertEqual(restored["radio"]["channel"], 6)
             self.assertTrue(restored["needsCalibration"])

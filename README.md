@@ -37,7 +37,9 @@ cd csi-monitor
 
 Python은 3.10 이상이면 동작한다. 펌웨어를 직접 빌드할 때만 3.12를 권장한다.
 
-그 밖의 절차는 [개발 환경](docs/environment.md), [사용법](docs/usage.md),
+그 밖의 절차는 [개발 환경](docs/environment.md),
+[macOS 사용법](docs/usage-macos.md), [Windows 사용법](docs/usage-windows.md),
+[공통 사용법](docs/usage.md),
 [실험 규약](docs/experiment-protocol.md), [ML 학습·시스템 적용 계획](docs/ml-system-integration-plan.md),
 [성장 및 추가 개발 로드맵](docs/growth-roadmap.md)을 참고한다.
 
