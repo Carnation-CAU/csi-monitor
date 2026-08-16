@@ -4,6 +4,7 @@ import numpy as np
 from csi_gateway.activity import (
     ActivityFrame,
     ActivityPrediction,
+    ActivityPredictionDisplaySmoother,
     AsyncFrameWindowEngine,
     FrameWindowEngine,
     MotionInferenceGate,
@@ -62,4 +63,24 @@ class ActivityTest(unittest.TestCase):
             self.assertEqual(engine.window.buffered_frames,0)
         finally:
             release.set(); engine.close()
+    def test_prediction_display_is_smoothed_rate_limited_and_held_by_caller(self):
+        display=ActivityPredictionDisplaySmoother(history_size=3,refresh_seconds=1.0)
+        walking=ActivityPrediction("walking",{"fall_suspected":.1,"walking":.8,"other_motion":.1},.8,1,950,"1","m","p")
+        other=ActivityPrediction("other_motion",{"fall_suspected":.1,"walking":.3,"other_motion":.6},.6,2,951,"2","m","p")
+        first=display.observe(walking,now=0.0)
+        self.assertEqual(first[0],"walking")
+        self.assertTrue(display.is_fresh(now=4.9,hold_seconds=5.0))
+        self.assertFalse(display.is_fresh(now=5.1,hold_seconds=5.0))
+        self.assertIsNone(display.observe(other,now=.2))
+        averaged=display.observe(other,now=1.0)
+        self.assertEqual(averaged[0],"walking")
+        self.assertAlmostEqual(averaged[1]["walking"],(0.8+0.3+0.3)/3)
+    def test_first_fall_display_bypasses_refresh_delay(self):
+        display=ActivityPredictionDisplaySmoother(refresh_seconds=10.0)
+        walking=ActivityPrediction("walking",{"fall_suspected":.1,"walking":.8,"other_motion":.1},.8,1,950,"1","m","p")
+        fall=ActivityPrediction("fall_suspected",{"fall_suspected":.95,"walking":.03,"other_motion":.02},.95,2,951,"2","m","p")
+        display.observe(walking,now=0.0)
+        urgent=display.observe(fall,now=.2)
+        self.assertIsNotNone(urgent)
+        self.assertEqual(urgent[0],"fall_suspected")
 if __name__=="__main__": unittest.main()

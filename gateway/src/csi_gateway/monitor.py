@@ -79,7 +79,11 @@ from .radar import (
     parse_radar_line,
 )
 from .prototype import predict_action
-from .activity import ActivityFrame, AsyncFrameWindowEngine
+from .activity import (
+    ActivityFrame,
+    ActivityPredictionDisplaySmoother,
+    AsyncFrameWindowEngine,
+)
 from .activity_events import ActivityEventAggregator
 from .csi import RAW_CSI_ENABLE_COMMAND, parse_csi_line
 
@@ -214,6 +218,11 @@ def run_monitor(
             self.activity_model_device = ""
             self.csi_frame_count = 0
             self.last_csi_at = 0.0
+            self.activity_display = ActivityPredictionDisplaySmoother(
+                history_size=5,
+                refresh_seconds=1.0,
+            )
+            self.has_activity_prediction = False
             if activity_model:
                 try:
                     if str(self.project_root) not in sys.path:
@@ -1197,8 +1206,16 @@ def run_monitor(
             suspended = self.scanning_channels or self.calibrating or self.collecting
             if suspended:
                 self.activity_engine.deactivate(clear_frames=True)
+                self.activity_display.reset()
+                self.has_activity_prediction = False
                 if self.activity_aggregator is not None:
                     self.activity_aggregator.reset()
+                paused_text = "행동 분류: 보정·수집 중 일시 정지"
+                if self.activity_status.text() != paused_text:
+                    self.activity_status.setText(paused_text)
+                    self.activity_status.setStyleSheet(
+                        "background:#495057;color:white;padding:10px;border-radius:6px;"
+                    )
                 return
             self.activity_engine.submit(
                 ActivityFrame(sample.sequence, sample.timestamp, sample.amplitude),
@@ -1247,7 +1264,17 @@ def run_monitor(
                     self.activity_status.setStyleSheet(
                         "background:#495057;color:white;padding:10px;border-radius:6px;"
                     )
+                elif self.has_activity_prediction and self.activity_display.is_fresh(
+                    now=now,
+                    hold_seconds=5.0,
+                ):
+                    # Keep a recent stable result visible without presenting
+                    # an old action as the current classification forever.
+                    return
                 else:
+                    if self.has_activity_prediction:
+                        self.activity_display.reset()
+                        self.has_activity_prediction = False
                     self.activity_status.setText(
                         "행동 분류: 모델 준비됨 · Radar 움직임 대기"
                     )
@@ -1255,10 +1282,6 @@ def run_monitor(
                         "background:#087f3d;color:white;padding:10px;border-radius:6px;"
                     )
                 return
-            scores = " · ".join(f"{name} {value * 100:.0f}%" for name,value in prediction.scores.items())
-            self.activity_status.setText(f"행동 분류: {prediction.label} · {scores}")
-            color = "#b42318" if prediction.label == "fall_suspected" else "#175cd3"
-            self.activity_status.setStyleSheet(f"background:{color};color:white;padding:10px;border-radius:6px;")
             if self.activity_aggregator is not None:
                 for event in self.activity_aggregator.observe(
                     prediction,
@@ -1266,6 +1289,22 @@ def run_monitor(
                     detected_at=utc_now(),
                 ):
                     self.handle_live_detection(event)
+            display = self.activity_display.observe(prediction, now=now)
+            if display is None:
+                return
+            label, averaged_scores = display
+            scores = " · ".join(
+                f"{name} {value * 100:.0f}%"
+                for name, value in averaged_scores.items()
+            )
+            self.has_activity_prediction = True
+            self.activity_status.setText(
+                f"행동 분류(최근 5회 평균 · 5초 유지): {label} · {scores}"
+            )
+            color = "#b42318" if label == "fall_suspected" else "#175cd3"
+            self.activity_status.setStyleSheet(
+                f"background:{color};color:white;padding:10px;border-radius:6px;"
+            )
 
         def finish_collection(
             self,

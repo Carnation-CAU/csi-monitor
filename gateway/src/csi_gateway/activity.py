@@ -1,5 +1,6 @@
 """Stable model-neutral contracts and recent-frame inference engine."""
 from __future__ import annotations
+from collections import deque
 from concurrent.futures import Future,ThreadPoolExecutor
 from dataclasses import dataclass
 from threading import Lock
@@ -52,6 +53,62 @@ class MotionInferenceGate:
 
     def reset(self) -> None:
         self._active_until = -float("inf")
+
+
+class ActivityPredictionDisplaySmoother:
+    """Average recent scores and rate-limit UI-only prediction updates."""
+
+    def __init__(self, history_size: int = 5, refresh_seconds: float = 1.0) -> None:
+        if history_size <= 0:
+            raise ValueError("history_size must be positive")
+        if refresh_seconds <= 0:
+            raise ValueError("refresh_seconds must be positive")
+        self._scores: deque[dict[str, float]] = deque(maxlen=history_size)
+        self.refresh_seconds = refresh_seconds
+        self._last_rendered_at = -float("inf")
+        self._last_observed_at = -float("inf")
+        self._displayed_label: str | None = None
+
+    def observe(
+        self,
+        prediction: ActivityPrediction,
+        *,
+        now: float,
+    ) -> tuple[str, dict[str, float]] | None:
+        self._scores.append(dict(prediction.scores))
+        self._last_observed_at = now
+        urgent_fall = (
+            prediction.label == "fall_suspected"
+            and self._displayed_label != "fall_suspected"
+        )
+        if not urgent_fall and now - self._last_rendered_at < self.refresh_seconds:
+            return None
+
+        if urgent_fall:
+            averaged = dict(prediction.scores)
+            label = "fall_suspected"
+        else:
+            labels = tuple(prediction.scores)
+            averaged = {
+                label: sum(scores.get(label, 0.0) for scores in self._scores)
+                / len(self._scores)
+                for label in labels
+            }
+            label = max(averaged, key=averaged.get)
+        self._last_rendered_at = now
+        self._displayed_label = label
+        return label, averaged
+
+    def is_fresh(self, *, now: float, hold_seconds: float = 5.0) -> bool:
+        if hold_seconds < 0:
+            raise ValueError("hold_seconds cannot be negative")
+        return now - self._last_observed_at <= hold_seconds
+
+    def reset(self) -> None:
+        self._scores.clear()
+        self._last_rendered_at = -float("inf")
+        self._last_observed_at = -float("inf")
+        self._displayed_label = None
 
 class FrameWindowEngine:
     """Keep recent frames and call a model at a bounded 10-30 Hz rate."""
