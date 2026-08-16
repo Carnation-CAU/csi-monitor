@@ -63,7 +63,7 @@ def create_profile(
             "rxPosition": "사용자가 기록한 위치",
             "antennaGuidance": "보정 당시의 높이와 안테나 방향을 동일하게 복원",
         },
-        "radio": {"channel": channel, "bandwidth": "HT40", "txRateHz": 100},
+        "radio": {"channel": channel, "bandwidth": "HT20", "txRateHz": 100},
         "calibration": None,
         "needsCalibration": True,
         "devices": {
@@ -108,7 +108,7 @@ def default_workspace_profile() -> dict[str, Any]:
             "rxPosition": "",
             "antennaGuidance": "보정 당시의 높이와 안테나 방향을 동일하게 복원",
         },
-        "radio": {"channel": 6, "bandwidth": "HT40", "txRateHz": 100},
+        "radio": {"channel": 6, "bandwidth": "HT20", "txRateHz": 100},
         "calibration": None,
         "needsCalibration": True,
         "devices": {

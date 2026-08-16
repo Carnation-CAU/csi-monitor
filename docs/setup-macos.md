@@ -2,7 +2,8 @@
 
 새 Mac에서 이 프로젝트를 처음 실행할 때의 순서다. 위에서부터 차례대로 진행한다.
 Windows와 동일한 프로젝트 commit, `esp-csi` 고정 commit, ESP-IDF v5.0.2를 사용한다.
-현재 환경 기준값은 [개발 환경](environment.md), 매일 쓰는 사용 절차는 [사용법](usage.md)을 참고한다.
+현재 환경 기준값은 [개발 환경](environment.md), 매일 쓰는 명령은
+[macOS 사용법](usage-macos.md), 공통 보정·수집 규칙은 [공통 사용법](usage.md)을 참고한다.
 
 ## 이 문서의 범위
 
@@ -107,7 +108,8 @@ chmod +x scripts/*.sh
 ```
 
 이어서 `.venv`를 만들고 `pyserial`, `PyQt5`, `pyqtgraph`, `numpy`, `pandas`,
-`scipy`, 로컬 모델 추론용 `torch`와 `torchvision`을 설치한다.
+`scipy`, 로컬 모델 추론용 `torch`와 `torchvision`, prebuilt 업로드용
+`esptool`을 설치한다.
 
 특정 버전을 강제하려면 `CSI_PYTHON`으로 지정한다.
 
@@ -201,35 +203,16 @@ firmware/prebuilt/
 | | `0x1d000` | `firmware/prebuilt/rx/ota_data_initial.bin` |
 | | `0x20000` | `firmware/prebuilt/rx/console_test.bin` |
 
-빌드 출처와 SHA-256은 [firmware/prebuilt/README.md](../firmware/prebuilt/README.md)에 있다. 이 바이너리에는 프로젝트 패치가 적용되어 있어 채널 전환 명령이 포함되고 기본 채널이 `6`이다.
+빌드 출처와 SHA-256은 [firmware/prebuilt/README.md](../firmware/prebuilt/README.md)에
+있다. 이 바이너리는 **HT20, 기본 채널 6, TX 100Hz**이며 채널 1·6·11 동시
+전환 명령을 포함한다. `bootstrap.sh`가 `esptool`도 설치하므로 추가 설치는 없다.
 
-esptool을 설치한다.
-
-```bash
-python -m pip install esptool
-```
-
-아래 명령은 **프로젝트 루트에서** 실행한다. 포트는 4장에서 확인한 실제 경로로 바꾼다.
-
-TX 보드에 업로드한다. flash size는 2MB다.
+아래 명령은 **프로젝트 루트에서** 실행하고 포트는 4장에서 확인한 실제 경로로
+바꾼다. 역할별 스크립트가 flash size와 오프셋을 고정한다.
 
 ```bash
-python -m esptool --chip esp32s3 -p /dev/cu.usbmodem-SENDER -b 460800 write_flash \
-  --flash_mode dio --flash_freq 80m --flash_size 2MB \
-  0x0 firmware/prebuilt/tx/bootloader.bin \
-  0x8000 firmware/prebuilt/tx/partition-table.bin \
-  0x10000 firmware/prebuilt/tx/csi_send.bin
-```
-
-RX 보드에 업로드한다. flash size는 4MB이고 앱 오프셋이 `0x20000`이다.
-
-```bash
-python -m esptool --chip esp32s3 -p /dev/cu.wchusbserial-RECEIVER -b 460800 write_flash \
-  --flash_mode dio --flash_freq 80m --flash_size 4MB \
-  0x0 firmware/prebuilt/rx/bootloader.bin \
-  0x8000 firmware/prebuilt/rx/partition-table.bin \
-  0x1d000 firmware/prebuilt/rx/ota_data_initial.bin \
-  0x20000 firmware/prebuilt/rx/console_test.bin
+./scripts/flash-prebuilt.sh tx /dev/cu.usbmodem-SENDER
+./scripts/flash-prebuilt.sh rx /dev/cu.usbmodem-RECEIVER
 ```
 
 **TX와 RX의 펌웨어를 바꿔 굽지 않도록 주의한다.** RX 앱을 TX와 같은 `0x10000`에 구우면 부팅되지 않는다.
@@ -316,22 +299,24 @@ idf.py -p /dev/cu.wchusbserial-RECEIVER -b 460800 flash
 스크립트는 기본적으로 `ml/v_main/model.pt`를 로컬에서 불러온다. 파일이 없거나
 `MODEL_SPEC.json`의 SHA-256과 다르면 ML만 `모델 사용 불가`로 표시되고 Radar와
 재실 모니터는 계속 동작한다. Apple Silicon에서 MPS 추론이 지원되지 않는 연산을
-만나면 자동으로 CPU로 전환한다. 모델이 정상 로드되면 RX의 LLFT 원시 CSI 출력도
-자동으로 활성화한다.
+만나면 자동으로 CPU로 전환한다. 모델이 정상 로드되면 RX의 LLTF 원시 CSI 출력도
+자동으로 활성화한다. 펌웨어 명령 인자의 철자만 `LLFT`다.
 
 GUI 실행 전 checkpoint와 PyTorch runtime을 확인할 수 있다.
 
 ```bash
-csi-gateway activity-model-check --project-root .
+.venv/bin/python -m csi_gateway activity-model-check --project-root .
 ```
 
 `status`가 `ok`이면 실제 checkpoint를 불러와 `950 x 52` 인공 입력으로 1회 추론한
-것이다. 이 결과 라벨은 정확도 평가가 아니다.
+것이다. 이 결과 라벨은 정확도 평가가 아니다. HT20 펌웨어의 104개 raw I/Q가
+52개 amplitude로 변환되어 모델 shape와 맞지만, 공개 C3 학습 데이터와 실제 S3
+입력의 차이는 자체 검증으로 확인해야 한다.
 
 데이터 수집:
 
 ```bash
-./scripts/collect.sh /dev/cu.wchusbserial-RECEIVER empty_room 60
+./scripts/collect.sh /dev/cu.wchusbserial-RECEIVER empty_room 300
 ```
 
 직접 실행할 수도 있다.
@@ -352,7 +337,8 @@ python -m csi_gateway monitor --port /dev/cu.wchusbserial-RECEIVER --baud 200000
 4. 완료 창에서 선택 채널과 프로필 저장 결과를 확인한다.
 5. 30초 정지에서 `STATIC`, 이후 움직임에서 `MOVEMENT DETECTED`가 뜨는지 확인한다.
 
-자세한 절차는 [사용법의 빈 공간 보정](usage.md#4-빈-공간-보정)과 [공간 프로필](usage.md#41-공간-프로필-저장과-복원)을 참고한다.
+자세한 절차는 [공통 사용법의 채널·공간 보정](usage.md#4-채널--공간-통합-보정)과
+[공간 프로필](usage.md#41-공간-프로필-저장과-복원)을 참고한다.
 
 ### 프로필의 보드 MAC
 
@@ -394,4 +380,6 @@ python -m csi_gateway monitor --port /dev/cu.wchusbserial-RECEIVER --baud 200000
 
 ## 10. 다음 단계
 
-세팅이 끝나면 [사용법](usage.md)의 매일 시작 순서, 빈 공간 보정, 공간 프로필과 행동 수집 절차를 따른다. 새 Mac/새 방/새 보드는 기존 프로필을 그대로 쓰지 말고 별도 프로필로 관리한다.
+세팅이 끝나면 [macOS 사용법](usage-macos.md)의 매일 실행 명령과
+[공통 사용법](usage.md)의 보정·공간 프로필·행동 수집 절차를 따른다. 새 Mac,
+새 방과 새 보드는 기존 프로필을 그대로 쓰지 말고 별도 프로필로 관리한다.

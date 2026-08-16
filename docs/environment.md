@@ -1,9 +1,11 @@
 # ESP32-S3 Wi-Fi CSI 개발 환경
 
-최종 확인일: 2026-08-04
+최종 확인일: 2026-08-17
 
 이 문서는 프로젝트의 기준 환경을 기록하는 문서다. 설치 경로와 측정 결과는
-사용자마다 다르므로, 각자 자신의 환경에서 확인한 값을 기준으로 삼는다. 프로그램 사용 순서는 [사용법](usage.md)을 참고한다.
+사용자마다 다르므로, 각자 자신의 환경에서 확인한 값을 기준으로 삼는다. 실제
+명령은 [macOS 사용법](usage-macos.md) 또는 [Windows 사용법](usage-windows.md),
+공통 절차는 [공통 사용법](usage.md)을 참고한다.
 
 ## 문서 동기화 규칙
 
@@ -24,7 +26,7 @@ ESP32-S3 TX
 ESP32-S3 RX
   └─ CSI 수집 및 Espressif Radar 값 계산
              ↓ UART, 2,000,000 baud
-Windows PC
+Windows 또는 macOS PC
   ├─ Python 실시간 움직임 모니터
   ├─ 원본 직렬 데이터 저장
   └─ 향후 전처리·학습·서버 전송
@@ -76,15 +78,16 @@ ESP32 펌웨어의 핵심 C 감지 코드는 현재 수정하지 않았다.
 | 펌웨어 대상 | `esp32s3` |
 | RX 직렬 속도 | `2,000,000 baud` |
 | TX/RX Wi-Fi 채널 | 런타임 `1`, `6`, `11`; 재시작 시 기본값 `6` |
-| TX Wi-Fi 채널 폭 | `HT40 (40 MHz)` 시험 설정 |
+| TX/RX Wi-Fi 채널 폭 | `HT20 (20 MHz)` ESP-Fi 호환 수집 설정 |
 | TX 설정 송신 빈도 | `100 Hz` |
 
 기준값은 루트의 `versions.json`에도 기록한다.
 
-예비 시험에서 HT20보다 HT40의 Radar 결과와 패킷 연속성이 좋았고, 채널 1·6·11
-비교에서는 환경에 따라 선택이 달라졌다. 따라서 특정 채널을 고정 권장값으로 두지
-않고, 각 설치 환경에서 GUI의 자동 채널 비교로 결정한다. 보드 재시작 시 기본
-채널은 `6`이다.
+예비 Radar 시험에서는 HT40의 패킷 연속성이 더 좋았지만, ESP-Fi의 52개
+서브캐리어 입력과 호환되는 자체 데이터를 모으기 위해 TX/RX를 HT20으로
+고정했다. 채널 1·6·11 중 선택 결과는 환경에 따라 달라지므로 특정 채널을
+고정 권장값으로 두지 않고 GUI의 자동 채널 비교로 결정한다. 보드 재시작 시
+기본 채널은 `6`이다.
 
 개발용 자동 채널 비교와 PC 공간 프로필 저장은 GUI에 구현했으며, 보드 자체의
 NVS 영구 저장과 장애 자동 복구는 아직 구현하지 않았다.
@@ -190,14 +193,16 @@ startup-competition/
 ├─ gateway/src/csi_gateway/   PC 수집기와 모니터
 ├─ gateway/tests/             Python 테스트
 ├─ scripts/                   Windows/macOS 실행 스크립트
-├─ third_party/esp-csi/       고정된 Espressif 공식 저장소
+├─ third_party/esp-csi/       직접 빌드할 때만 내려받는 공식 소스(Git 제외)
 ├─ data/raw/                  원본 JSONL 데이터
 ├─ data/manifests/            수집 세션 메타데이터
 ├─ data/profiles/             공간별 배치·채널·보정값과 세션 연결
 ├─ data/datasets/             가져온 팀 데이터셋 라이브러리
 ├─ data/exports/              팀 공유용 데이터셋 ZIP 출력
 ├─ docs/environment.md        현재 환경 기준
-└─ docs/usage.md              실제 사용 절차
+├─ docs/usage-macos.md        macOS 실행 명령
+├─ docs/usage-windows.md      Windows 실행 명령
+└─ docs/usage.md              공통 보정·수집 규칙
 ```
 
 ## 7. 확인된 펌웨어 빌드
@@ -206,10 +211,10 @@ startup-competition/
 
 | 펌웨어 | 용도 | 크기 | SHA-256 |
 |---|---|---:|---|
-| `csi_send.bin` | TX | 685,600 bytes | `9039F1F1F27148FBBD52625E23C59AA771404AA0F7B60A9295E3BC1A2C18A6DA` |
-| `console_test.bin` | RX | 825,904 bytes | `174AD1E24FB1A275CE7F877C7F20D00437A7690574AF3764D52BF3D83A5C9B1C` |
+| `csi_send.bin` | TX | 685,584 bytes | `C2C9752FBE72B466ECD4D22D1FA16D15C1B2B5BFD254506E56FE1D3590A11150` |
+| `console_test.bin` | RX | 826,112 bytes | `BFCD7B5253BDE31BC6F405D517B49279124E2A1C2E91F62438AFC6B313105160` |
 
-**이 해시는 재현되지 않는다.** 두 프로젝트 모두 `CONFIG_APP_REPRODUCIBLE_BUILD`가 비활성이므로 빌드 시각과 빌드 경로가 바이너리에 포함된다. 같은 커밋과 같은 패치로 다시 빌드해도 해시는 달라진다. 위 값은 2026-08-04 빌드의 기록이며, 다른 환경에서 대조할 검증 기준이 아니다.
+**이 해시는 재현되지 않는다.** 두 프로젝트 모두 `CONFIG_APP_REPRODUCIBLE_BUILD`가 비활성이므로 빌드 시각과 빌드 경로가 바이너리에 포함된다. 같은 커밋과 같은 패치로 다시 빌드해도 해시는 달라진다. 위 값은 2026-08-17 HT20 빌드의 기록이며, 다른 환경에서 대조할 검증 기준이 아니다.
 
 환경 동일성은 다음으로 판단한다.
 
@@ -225,7 +230,7 @@ startup-competition/
 - RX UART `2,000,000 baud` 확인
 - 움직임 구간의 평균 jitter가 정지 구간보다 뚜렷하게 높음
 - 프로젝트 모니터에서 Radar 값, 링크 상태와 빈 공간 보정 명령 지원
-- Python 자동 테스트 41개 통과
+- Python 자동 테스트 67개 통과
 - `rf_channel` 명령으로 채널 `1`/`6`/`11` 동기 전환 및 복귀 확인
 
 ## 8.1 개발용 자동 채널 비교 확장
@@ -234,7 +239,7 @@ startup-competition/
 
 - TX: RX가 보내는 채널 전환 제어 패킷 수신
 - RX: `rf_channel` 조회 및 `rf_channel --set 1|6|11` 동기 전환 명령
-- GUI: 현재 Wi-Fi 채널과 HT40 표시
+- GUI: 현재 Wi-Fi 채널과 HT20 표시
 - GUI: 채널 1·6·11의 링크 품질 자동 비교, 최종 채널 선택과 빈 공간 보정 연속 실행
 
 Espressif의 CSI 수집, Radar waveform 계산, `move/static` 판정식과 빈 공간

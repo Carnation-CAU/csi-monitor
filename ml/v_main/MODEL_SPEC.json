@@ -30,6 +30,14 @@
     "epsilon": 0.000001,
     "caller_must_normalize": false
   },
+  "radio_compatibility": {
+    "deployment_chip": "ESP32-S3",
+    "bandwidth": "HT20",
+    "ltf": "LLTF",
+    "raw_iq_length": 104,
+    "derived_amplitude_bins": 52,
+    "source_dataset_radio_metadata": "not published; compatibility is based on the 52-subcarrier input contract"
+  },
   "labels": {
     "internal": ["fall", "walking", "other_motion"],
     "external": ["fall_suspected", "walking", "other_motion"],
@@ -63,6 +71,7 @@
   },
   "limitations": [
     "Public ESP-Fi HAR uses ESP32-C3 data rather than the target ESP32-S3 deployment.",
+    "Matching HT20 and the 52-bin input shape removes a configuration mismatch but does not guarantee improved accuracy.",
     "The selected checkpoint is a cross-validation fold checkpoint, not a full-data refit.",
     "Environment-grouped validation and a locked local ESP32-S3 test are still required.",
     "Scores are model softmax probabilities and are not calibrated safety probabilities."

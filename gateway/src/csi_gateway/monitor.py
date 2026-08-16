@@ -36,7 +36,9 @@ from .fall_alert import (
 from .live_detection import (
     DetectionEvent,
     EventJournal,
+    FALL_HISTORY_EVENT_TYPES,
     LiveActionDetector,
+    format_fall_history_record,
 )
 from .datasets import (
     DatasetError,
@@ -107,6 +109,7 @@ def run_monitor(
         QMessageBox,
         QInputDialog,
         QPushButton,
+        QPlainTextEdit,
         QHBoxLayout,
         QSpinBox,
         QVBoxLayout,
@@ -295,13 +298,24 @@ def run_monitor(
                 "background:#495057;color:white;padding:10px;border-radius:6px;"
             )
 
+            self.fall_history = QPlainTextEdit()
+            self.fall_history.setReadOnly(True)
+            self.fall_history.setMaximumBlockCount(100)
+            self.fall_history.setMaximumHeight(145)
+            self.fall_history.setPlaceholderText("아직 기록된 낙상 후보가 없습니다.")
+            fall_history_layout = QVBoxLayout()
+            fall_history_layout.addWidget(self.fall_history)
+            fall_history_group = QGroupBox("최근 낙상 후보·감지 기록 (최신순)")
+            fall_history_group.setLayout(fall_history_layout)
+            self.refresh_fall_history()
+
             if self.activity_model_error:
                 activity_text = f"행동 분류: 모델 사용 불가 · {self.activity_model_error}"
             elif self.activity_engine is None:
                 activity_text = "행동 분류: 모델 미설정 · Radar 감지만 사용"
             else:
                 activity_text = (
-                    "행동 분류: 원시 CSI 대기 · LLFT 자동 활성화 · "
+                    "행동 분류: 원시 CSI 대기 · LLTF 자동 활성화 · "
                     f"{self.activity_model_device}"
                 )
             self.activity_status = QLabel(activity_text)
@@ -470,6 +484,7 @@ def run_monitor(
             layout.addWidget(self.presence_status)
             layout.addWidget(self.action_status)
             layout.addWidget(self.activity_status)
+            layout.addWidget(fall_history_group)
             layout.addWidget(self.link_status)
             layout.addWidget(self.channel_status)
             layout.addWidget(self.details)
@@ -1214,7 +1229,7 @@ def run_monitor(
                         self.handle_live_detection(event)
                 if self.csi_frame_count == 0:
                     self.activity_status.setText(
-                        "행동 분류: 원시 CSI 대기 · LLFT 자동 활성화 명령 전송됨"
+                        "행동 분류: 원시 CSI 대기 · LLTF 자동 활성화 명령 전송됨"
                     )
                     self.activity_status.setStyleSheet(
                         "background:#495057;color:white;padding:10px;border-radius:6px;"
@@ -1470,6 +1485,8 @@ def run_monitor(
                 "channel": self.current_channel,
             }
             event_path = self.event_journal.append(record)
+            if event.event_type in FALL_HISTORY_EVENT_TYPES:
+                self.refresh_fall_history()
             labels = {
                 "moving": "움직임",
                 "static": "정지",
@@ -1570,6 +1587,13 @@ def run_monitor(
                     "status": status,
                     "message": message,
                 }
+            )
+            self.refresh_fall_history()
+
+        def refresh_fall_history(self) -> None:
+            records = self.event_journal.recent_fall_records(limit=20)
+            self.fall_history.setPlainText(
+                "\n".join(format_fall_history_record(record) for record in records)
             )
 
         def release_fall_alert_worker(self, worker: FallAlertWorker) -> None:
@@ -2019,7 +2043,7 @@ def run_monitor(
         def update_channel(self, sample: ChannelSample) -> None:
             self.current_channel = sample.channel
             self.channel_status.setText(
-                f"Current Wi-Fi channel: {sample.channel}  |  Bandwidth: HT40"
+                f"Current Wi-Fi channel: {sample.channel}  |  Bandwidth: HT20"
             )
 
         def show_link(self, sample: LinkSample) -> None:

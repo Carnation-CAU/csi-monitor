@@ -25,7 +25,7 @@ index 23e76c7..94c668e 100644
 
  #define RADAR_EVALUATE_SERVER_PORT          3232
  #define RADAR_BUFF_MAX_LEN                  25
-@@ -42,6 +48,18 @@ static QueueHandle_t g_csi_info_queue    = NULL;
+@@ -42,6 +48,13 @@ static QueueHandle_t g_csi_info_queue    = NULL;
  static bool g_wifi_connect_status        = false;
  static uint32_t g_send_data_interval     = 1000 / CONFIG_SEND_DATA_FREQUENCY;
  static const char *TAG                   = "app_main";
@@ -36,21 +36,21 @@ index 23e76c7..94c668e 100644
 +    uint8_t version;
 +    uint8_t channel;
 +} rf_control_packet_t;
-+
-+static wifi_second_chan_t get_secondary_channel(uint8_t channel)
-+{
-+    return channel == 11 ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
-+}
-
+ 
  static void wifi_init(void)
  {
-@@ -66,13 +84,85 @@ static void wifi_init(void)
+@@ -64,15 +77,90 @@ static void wifi_init(void)
+     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+     ESP_ERROR_CHECK(esp_wifi_start());
++    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20));
      esp_netif_create_default_wifi_sta();
      ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
      ESP_ERROR_CHECK(esp_wifi_set_protocol(WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G));
 -    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
 +    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
-+                                         get_secondary_channel(CONFIG_LESS_INTERFERENCE_CHANNEL)));
++                                         WIFI_SECOND_CHAN_NONE));
++    ESP_LOGI(TAG, "RF_CONFIG,channel=%u,bandwidth=HT20,send_frequency=%u",
++             CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_DATA_FREQUENCY);
 
  #ifdef RECV_ESPNOW_CSI 
      ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
@@ -108,7 +108,7 @@ index 23e76c7..94c668e 100644
 +    }
 +
 +    vTaskDelay(pdMS_TO_TICKS(RF_SWITCH_DELAY_MS));
-+    ESP_ERROR_CHECK(esp_wifi_set_channel(channel, get_secondary_channel(channel)));
++    ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
 +    printf("RF_CHANNEL,%u\n", channel);
 +    return ESP_OK;
 +}
@@ -131,7 +131,7 @@ index 23e76c7..94c668e 100644
  static struct {
      struct arg_lit *train_start;
      struct arg_lit *train_stop;
-@@ -605,6 +695,7 @@ void app_main(void)
+@@ -605,6 +693,7 @@ void app_main(void)
  #endif
  #endif
      wifi_init();
@@ -139,7 +139,7 @@ index 23e76c7..94c668e 100644
 
      ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
      ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &wifi_event_handler, NULL));
-@@ -614,6 +705,7 @@ void app_main(void)
+@@ -614,6 +703,7 @@ void app_main(void)
      cmd_register_wifi_config();
      cmd_register_wifi_scan();
      cmd_register_radar();
@@ -243,7 +243,7 @@ index ea99250..020879b 100644
  #include "nvs_flash.h"
 
  #include "esp_mac.h"
-@@ -20,11 +23,45 @@
+@@ -20,11 +23,40 @@
  #include "esp_now.h"
 
 
@@ -265,11 +265,6 @@ index ea99250..020879b 100644
 +    uint8_t channel;
 +} rf_control_packet_t;
 +
-+static wifi_second_chan_t get_secondary_channel(uint8_t channel)
-+{
-+    return channel == 11 ? WIFI_SECOND_CHAN_BELOW : WIFI_SECOND_CHAN_ABOVE;
-+}
-+
 +static void espnow_recv_cb(const esp_now_recv_info_t *info, const uint8_t *data, int data_len)
 +{
 +    if (!info || !data || data_len != sizeof(rf_control_packet_t)) {
@@ -290,17 +285,23 @@ index ea99250..020879b 100644
 
  static void wifi_init()
  {
-@@ -42,7 +79,8 @@ static void wifi_init()
+@@ -37,12 +69,13 @@ static void wifi_init()
+     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
+-    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, WIFI_BW_HT40));
++    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(ESP_IF_WIFI_STA, WIFI_BW_HT20));
+     ESP_ERROR_CHECK(esp_wifi_start());
+
      ESP_ERROR_CHECK(esp_wifi_config_espnow_rate(ESP_IF_WIFI_STA, WIFI_PHY_RATE_MCS0_SGI));
      ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
 
 -    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL, WIFI_SECOND_CHAN_BELOW));
 +    ESP_ERROR_CHECK(esp_wifi_set_channel(CONFIG_LESS_INTERFERENCE_CHANNEL,
-+                                         get_secondary_channel(CONFIG_LESS_INTERFERENCE_CHANNEL)));
++                                         WIFI_SECOND_CHAN_NONE));
      ESP_ERROR_CHECK(esp_wifi_set_mac(WIFI_IF_STA, CONFIG_CSI_SEND_MAC));
  }
 
-@@ -70,9 +108,10 @@ void app_main()
+@@ -70,9 +103,10 @@ void app_main()
       */
      ESP_ERROR_CHECK(esp_now_init());
      ESP_ERROR_CHECK(esp_now_set_pmk((uint8_t *)"pmk1234567890123"));
@@ -312,14 +313,17 @@ index ea99250..020879b 100644
          .ifidx     = WIFI_IF_STA,    
          .encrypt   = false,   
          .peer_addr = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff},
-@@ -84,6 +123,15 @@ void app_main()
+@@ -83,7 +117,16 @@ void app_main()
+     ESP_LOGI(TAG, "================ CSI SEND ================");
+-    ESP_LOGI(TAG, "wifi_channel: %d, send_frequency: %d, mac: " MACSTR,
++    ESP_LOGI(TAG, "wifi_channel: %d, bandwidth: HT20, send_frequency: %d, mac: " MACSTR,
               CONFIG_LESS_INTERFERENCE_CHANNEL, CONFIG_SEND_FREQUENCY, MAC2STR(CONFIG_CSI_SEND_MAC));
 
      for (uint8_t count = 0; ;++count) {
 +        if (g_pending_channel) {
 +            uint8_t channel = g_pending_channel;
 +            vTaskDelay(pdMS_TO_TICKS(RF_SWITCH_DELAY_MS));
-+            ESP_ERROR_CHECK(esp_wifi_set_channel(channel, get_secondary_channel(channel)));
++            ESP_ERROR_CHECK(esp_wifi_set_channel(channel, WIFI_SECOND_CHAN_NONE));
 +            g_current_channel = channel;
 +            g_pending_channel = 0;
 +            ESP_LOGI(TAG, "RF_CHANNEL,%u", channel);

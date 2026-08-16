@@ -51,7 +51,9 @@ fi
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e ".[gui,ml-runtime]"
+python -m pip install esptool
 
 echo "기본 Python 환경 구성이 완료되었습니다."
 echo "활성화: . .venv/bin/activate"
 echo "포트 확인: python -m csi_gateway ports"
+echo "macOS 사용법: docs/usage-macos.md"

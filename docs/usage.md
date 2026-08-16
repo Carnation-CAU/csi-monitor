@@ -1,8 +1,16 @@
-# ESP32-S3 Wi-Fi CSI 사용법
+# ESP32-S3 Wi-Fi CSI 공통 사용법
 
-최종 확인일: 2026-08-11
+최종 확인일: 2026-08-17
 
-이 문서는 현재 하드웨어를 연결하고 움직임을 확인하며 데이터를 수집하는 실제 절차를 설명한다. 설치 버전과 경로는 [개발 환경](environment.md)을 참고한다.
+이 문서는 운영체제와 무관한 보정, 화면 해석, 공간 프로필과 데이터 규칙을
+설명한다. 실제 명령은 운영체제별 문서로 분리했다.
+
+- [macOS 사용법](usage-macos.md)
+- [Windows 사용법](usage-windows.md)
+
+처음 설치하는 경우에는 [macOS 초기 세팅](setup-macos.md) 또는
+[Windows 초기 세팅](setup-windows.md)을 먼저 따른다. 설치 버전과 경로는
+[개발 환경](environment.md)을 참고한다.
 
 ## 문서 동기화 규칙
 
@@ -29,29 +37,14 @@
 
 ## 2. 매일 시작하는 순서
 
-PowerShell에서:
+1. TX에 전원을 공급하고 RX의 UART 포트를 PC에 연결한다.
+2. 운영체제별 사용법의 `ports` 명령으로 RX 포트를 확인한다.
+3. 운영체제별 모니터 스크립트를 실행한다.
+4. 현재 공간 프로필과 채널을 확인하고 필요하면 적용한다.
 
-프로젝트 폴더로 이동한 뒤:
-
-```powershell
-Set-ExecutionPolicy -Scope Process Bypass
-```
-
-### 2.1 RX 포트 확인
-
-```powershell
-.\.venv\Scripts\python.exe -m csi_gateway ports
-```
-
-현재 RX 예시는 `COM8`이다. COM 번호가 바뀌면 이후 명령의 포트를 실제 번호로 바꾼다.
-
-### 2.2 실시간 모니터 실행
-
-```powershell
-.\scripts\start-radar-monitor.ps1 -Port COM8
-```
-
-공식 GUI, 프로젝트 모니터, 데이터 수집기와 `idf.py monitor`는 같은 COM 포트를 동시에 사용할 수 없다.
+공식 GUI, 프로젝트 모니터, 데이터 수집기와 시리얼 터미널은 같은 RX 포트를
+동시에 사용할 수 없다. 명령은 [macOS 사용법](usage-macos.md) 또는
+[Windows 사용법](usage-windows.md)을 참고한다.
 
 ## 3. 모니터 읽는 방법
 
@@ -120,22 +113,18 @@ Set-ExecutionPolicy -Scope Process Bypass
 ### 3.2 평상시 자동 행동 기록과 낙상 의심 알림
 
 빈 공간 보정이 완료된 프로필에서는 별도의 `행동 수집 시작` 버튼을 누르지 않아도
-모니터가 평상시 Radar 표본과 `ml/v_main/model.pt`를 함께 사용한다. 최근 950개
-CSI amplitude 프레임을 background worker에서 로컬 추론하고, 공식 `moving`이
+모니터가 평상시 Radar 표본과 `ml/v_main/model.pt`를 함께 사용한다. RX의 원본
+`CSI_DATA` 문자열에서 104개 I/Q 값을 읽고, 각 I/Q 쌍을 amplitude로 변환한 최근
+950개 × 52개 프레임을 background worker에서 로컬 추론한다. 원본 문자열, phase,
+RSSI와 기타 metadata가 모델에 직접 입력되는 것은 아니다. 공식 `moving`이
 끝난 뒤에도 3초 동안 tail window를 확인한다. 행동 수집, 채널 비교와 빈 공간
 보정 중에는 실험 동작을 실제 알림으로 오인하지 않도록 자동 감지를 잠시 멈춘다.
-모델이 정상 로드되면 모니터가 RX에 LLFT decimal 원시 CSI 출력을 자동으로
-활성화한다. 별도의 공식 ESP-Radar GUI에서 raw display를 켤 필요가 없다.
+모델이 정상 로드되면 모니터가 RX에 LLTF decimal 원시 CSI 출력을 자동으로
+활성화한다. 펌웨어 명령 인자의 철자만 호환성을 위해 `LLFT`를 사용한다. 별도의
+공식 ESP-Radar GUI에서 raw display를 켤 필요가 없다.
 
-모니터를 열기 전에 checkpoint 자체를 바로 확인하려면 다음 명령을 실행한다.
-
-```powershell
-csi-gateway activity-model-check --project-root .
-```
-
-```bash
-csi-gateway activity-model-check --project-root .
-```
+모니터를 열기 전에 checkpoint 자체를 바로 확인하는 명령은
+[macOS 사용법](usage-macos.md)과 [Windows 사용법](usage-windows.md)에 있다.
 
 `status: ok`, 모델 버전, 실행 장치와 `inputShape: [950, 52]`가 출력되면 로컬
 runtime 경로가 정상이다. 함께 출력되는 `syntheticPrediction`은 인공 입력에 대한
@@ -151,6 +140,15 @@ data/events/YYYY-MM-DD.jsonl
 들어간다. 낙상 의심 알림의 `sending`, `delivered`, `failed`, `skipped` 전달 결과도
 같은 파일에 남으므로 앱 서버 장애와 미설정 상태를 나중에 확인할 수 있다.
 
+GUI의 `최근 낙상 후보·감지 기록 (최신순)` 영역에는 최근 20건을 다시 불러와
+표시한다. 앱 서버가 없거나 알림 전송에 실패해도 다음 정보는 GUI와 JSONL에 남는다.
+
+- 로컬 감지 시각
+- ML 후보, Radar 후보 또는 최종 융합 낙상 의심 구분
+- 신뢰 지표와 판단 출처
+- 충격비, 무회복 시간과 최대 ML 낙상 점수
+- window/event ID와 앱 알림 전달 상태
+
 겹치는 window에서 나온 ML 낙상 결과는 여러 번의 낙상이 아니라 한 행동 사건으로
 묶는다. ML `fall_suspected` score 0.8 이상인 사건과 Radar의
 `jitter / move_threshold` 2.5 이상 충격 후 8초간 회복 움직임 없음이 15초 안에서
@@ -162,12 +160,8 @@ data/events/YYYY-MM-DD.jsonl
 줍기와 큰 팔 동작을 포함해 시간당 오탐률과 낙상 recall을 측정한 뒤 validation
 데이터로 조정해야 한다.
 
-앱 서버 주소는 GUI의 `낙상 알림 서버`에 입력하거나 실행 전에 환경 변수로 준다.
-
-```powershell
-$env:CARNATION_EVENT_API_URL = "http://192.168.0.5:8080"
-.\scripts\start-radar-monitor.ps1 -Port COM8
-```
+앱 서버 주소는 GUI의 `낙상 알림 서버`에 입력하거나 실행 전에 운영체제의
+`CARNATION_EVENT_API_URL` 환경 변수로 준다.
 
 주소가 비어 있어도 감지 기록은 남고 알림 전달만 `skipped`로 기록된다.
 
@@ -357,10 +351,8 @@ manifest에는 `profileId`와 `roomId`가 함께 기록되고, 세션 ID는 사�
 
 반복 수집 현황을 확인하거나 모델 학습 입력을 만들 때 실행한다.
 
-```powershell
-.\.venv\Scripts\python.exe -m csi_gateway features `
-  --profile-id <profileId> `
-  --project-root .
+```bash
+python -m csi_gateway features --profile-id <profileId> --project-root .
 ```
 
 `<profileId>`는 `data/profiles`의 파일 이름이다. 결과는
@@ -502,26 +494,11 @@ TX를 PC에서 뽑아 보조배터리로 옮기면 전원이 재시작되며 선
 최종 위치에서도 링크가 충분히 안정적이면 그 위치에서 통합 보정을 한 번 더
 실행하는 것이 더 정확하다.
 
-현재 1·6·11은 HT20의 비중첩 채널이라는 이유만으로 고정한 것이 아니라,
-빠른 설치 시험을 위한 저·중·고 대표 채널이다. HT40에서는 서로 일부
-겹치며, 현재 자동 비교는 1~11 전체에서 절대 최적값을 찾는 기능은 아니다.
+현재 1·6·11은 HT20에서 서로 겹치지 않는 저·중·고 대표 채널이다. 현재 자동
+비교는 1~11 전체에서 절대 최적값을 찾는 기능은 아니다.
 
-```powershell
-.\scripts\collect.ps1 -Port COM8 -Label empty_room -Duration 60
-```
-
-직접 실행:
-
-```powershell
-.\.venv\Scripts\python.exe -m csi_gateway collect `
-  --port COM8 `
-  --baud 2000000 `
-  --duration 60 `
-  --label walking_slow `
-  --device-id rx-s3-001 `
-  --room-id studio `
-  --project-root .
-```
+운영체제별 수집 명령은 [macOS 사용법](usage-macos.md)과
+[Windows 사용법](usage-windows.md)을 참고한다.
 
 라벨 예시:
 
@@ -558,58 +535,27 @@ data/manifests/<session-id>.json
 
 ## 8. 펌웨어 빌드와 업로드
 
-평상시 모니터와 수집에는 ESP-IDF가 필요하지 않다. 펌웨어를 다시 빌드하거나 업로드할 때만 사용한다.
-
-### 빌드
-
-```powershell
-. .\scripts\activate-idf.ps1
-.\scripts\build-firmware.ps1
-```
-
-### 업로드
-
-모니터와 수집기를 먼저 닫고 포트를 다시 확인한다.
-
-```powershell
-.\scripts\flash-sender.ps1 -Port COM7
-.\scripts\flash-receiver.ps1 -Port COM8
-```
-
-펌웨어 변경, 재빌드와 보드 업로드는 사용자 승인 후 진행한다.
+평상시 모니터와 수집에는 ESP-IDF가 필요하지 않다. 저장소의 prebuilt HT20
+펌웨어는 운영체제별 `flash-prebuilt` 스크립트로 올린다. 소스를 수정하고 직접
+빌드할 때만 ESP-IDF v5.0.2와 `third_party/esp-csi`가 필요하다. 명령은
+[macOS 초기 세팅](setup-macos.md) 또는 [Windows 초기 세팅](setup-windows.md)을
+참고한다.
 
 ## 9. 공식 Espressif GUI
 
-```powershell
-.\scripts\start-csi-gui.ps1 -Port COM8
-```
-
-공식 GUI에는 Raw CSI, Radar, 보정, 통계와 행동 수집 기능이 있다. 현재 Python 환경과의 호환 문제로 갱신이 멈출 수 있어 기본 확인에는 프로젝트 모니터를 사용한다.
+공식 GUI에는 Raw CSI, Radar, 보정, 통계와 행동 수집 기능이 있다. 현재 Python
+환경과의 호환 문제로 갱신이 멈출 수 있어 기본 확인에는 프로젝트 모니터를
+사용한다. Windows 실행 명령은 [Windows 사용법](usage-windows.md)을 참고한다.
 
 공식 GUI와 프로젝트 모니터를 동시에 실행하지 않는다.
 
-## 10. macOS 사용
+## 10. 문제 해결
 
-```bash
-cd /path/to/startup-competition
-./scripts/bootstrap.sh
-. .venv/bin/activate
-python -m csi_gateway ports
-python -m csi_gateway monitor --port /dev/cu.usbserial-RECEIVER --baud 2000000
-python -m csi_gateway collect \
-  --port /dev/cu.usbserial-RECEIVER \
-  --baud 2000000 \
-  --duration 60 \
-  --label empty_room
-```
+### 직렬 포트 이름이 바뀜
 
-## 11. 문제 해결
+정상이다. 운영체제별 `ports` 명령으로 다시 확인하고 명령의 포트만 바꾼다.
 
-### COM 번호가 바뀜
-
-정상이다. `python -m csi_gateway ports`로 다시 확인하고 명령의 포트만 바꾼다.
-
-### COM 포트를 열 수 없음
+### 직렬 포트를 열 수 없음
 
 공식 GUI, 프로젝트 모니터, 수집기 또는 `idf.py monitor` 중 하나가 이미 포트를 사용 중인지 확인한다.
 
@@ -629,7 +575,7 @@ TX-RX를 2~3 m로 줄이고 높이와 안테나 방향을 맞춘다. 사람의 �
 
 `WAITING FOR NEXT RADAR RESULT` 후 `Samples`가 다시 증가하면 일시적인 Radar 결과 공백이다. 링크 데이터와 Samples가 모두 장시간 멈추면 TX 전원과 배치를 확인한다.
 
-## 12. 현재 구현 범위
+## 11. 현재 구현 범위
 
 현재 모니터는 Espressif RX 펌웨어의 보정된 `move/static`과 PC의 실험용 공간 전용 재실 판정을 확인하는 도구다. 다음 기능은 아직 구현되지 않았다.
 

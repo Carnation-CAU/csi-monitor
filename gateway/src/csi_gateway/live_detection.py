@@ -13,6 +13,63 @@ from .prototype import predict_action
 from .radar import RadarSample
 
 
+FALL_HISTORY_EVENT_TYPES = {
+    "fall_suspected",
+    "ml_fall_candidate",
+    "radar_fall_candidate",
+    "fall_alert_delivery",
+}
+
+
+def format_fall_history_record(record: dict[str, object]) -> str:
+    """Render one persisted fall-related record for the monitor history."""
+    timestamp = str(record.get("detected_at") or record.get("recorded_at") or "")
+    try:
+        detected = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        display_time = detected.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except ValueError:
+        display_time = timestamp or "시각 없음"
+
+    event_type = str(record.get("event_type") or "")
+    labels = {
+        "fall_suspected": "최종 낙상 의심",
+        "ml_fall_candidate": "ML 낙상 후보",
+        "radar_fall_candidate": "Radar 낙상 후보",
+        "fall_alert_delivery": "앱 알림 전달",
+    }
+    parts = [display_time, labels.get(event_type, event_type)]
+
+    confidence = record.get("confidence")
+    if isinstance(confidence, (int, float)):
+        parts.append(f"신뢰 지표 {float(confidence) * 100:.1f}%")
+    source = record.get("source")
+    if source:
+        parts.append(f"근거 {source}")
+
+    evidence = record.get("evidence")
+    if isinstance(evidence, dict):
+        impact_ratio = evidence.get("impact_ratio")
+        if isinstance(impact_ratio, (int, float)):
+            parts.append(f"충격비 {float(impact_ratio):.2f}")
+        no_recovery = evidence.get("no_recovery_sec")
+        if isinstance(no_recovery, (int, float)):
+            parts.append(f"무회복 {float(no_recovery):.1f}초")
+        ml_score = evidence.get("ml_fall_score_max")
+        if isinstance(ml_score, (int, float)):
+            parts.append(f"ML {float(ml_score) * 100:.1f}%")
+
+    status = record.get("status")
+    if status:
+        parts.append(f"전달 {status}")
+    message = record.get("message")
+    if message:
+        parts.append(str(message))
+    event_id = record.get("event_id") or record.get("window_id")
+    if event_id:
+        parts.append(f"ID {event_id}")
+    return " | ".join(parts)
+
+
 @dataclass(frozen=True)
 class LiveDetectionConfig:
     window_seconds: float = 8.0
@@ -114,6 +171,30 @@ class EventJournal:
                 json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
             )
         return path
+
+    def recent_fall_records(self, limit: int = 20) -> list[dict[str, object]]:
+        """Return newest persisted fall candidates, detections and deliveries."""
+        if limit <= 0 or not self.event_dir.is_dir():
+            return []
+        records: list[dict[str, object]] = []
+        for path in sorted(self.event_dir.glob("*.jsonl"), reverse=True):
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    isinstance(record, dict)
+                    and record.get("event_type") in FALL_HISTORY_EVENT_TYPES
+                ):
+                    records.append(record)
+                    if len(records) >= limit:
+                        return records
+        return records
 
 
 class LiveActionDetector:
