@@ -19,7 +19,7 @@ ESP-Fi HAR / UT-HAR / CSI-HAR-3room
 - NVIDIA GPU와 호환 드라이버
 - Python 3.12 64-bit 권장
 - 이 Git 저장소
-- Git에 포함되지 않는 공개 데이터셋 3개
+- Git에 포함되지 않는 공개 데이터셋 3개(ESP-Fi는 기존 폴더 사용, 나머지는 자동 다운로드)
 - 원본·가상환경·checkpoint를 위한 여유 공간 최소 15GB 권장
 
 GPU 확인:
@@ -32,7 +32,7 @@ GPU 이름, driver version과 memory가 출력되어야 한다.
 
 ---
 
-## 2. Git에 포함되지 않는 데이터 복사
+## 2. Git에 포함되지 않는 데이터 준비
 
 다음 경로는 `.gitignore`에 등록되어 GitHub에 올라가지 않는다.
 
@@ -40,7 +40,11 @@ GPU 이름, driver version과 memory가 출력되어야 한다.
 csi-monitor/ml/dataset/raw/**
 ```
 
-따라서 현재 PC에서 실습실 PC로 아래 세 개의 **압축 해제된 폴더**를 별도로 복사한다. ZIP은 학습에 필요 없다.
+따라서 `git pull`만으로는 데이터가 생기지 않는다. 실습실 PC에 이미 있는
+`ESP-Fi-HAR-full`은 그대로 사용하고, 없는 UT-HAR와 CSI-HAR는 4절의
+`download-datasets.bat`가 공식 배포처에서 자동으로 다운로드·압축 해제·검증한다.
+
+최종 폴더 구조는 다음과 같다. ZIP은 검증 후 자동으로 삭제된다.
 
 ```text
 csi-monitor/ml/dataset/raw/
@@ -107,17 +111,20 @@ run-smoke-test.bat
 run-all-cv.bat
 cross_validate.py
 check_environment.py
+download-datasets.bat
+download_datasets.py
 requirements.txt
 ```
 
 ---
 
-## 4. 공용 Python·CUDA 환경 설치
+## 4. 환경 설치와 공개 데이터 자동 다운로드
 
 한 번만 실행한다.
 
 ```bat
 setup-lab.bat
+download-datasets.bat
 ```
 
 이 스크립트는 `csi-monitor/.venv` 하나에 다음을 설치한다.
@@ -126,8 +133,26 @@ setup-lab.bat
 - CUDA PyTorch와 torchvision
 - NumPy, SciPy, scikit-learn
 - v5.1 학습 의존성
+- 공개 데이터 다운로드 도구
 
 학습과 gateway가 같은 환경을 사용하므로 학습 checkpoint를 monitor에서 바로 불러올 수 있다.
+
+`download-datasets.bat`는 다음 작업을 수행한다.
+
+1. 공식 SenseFi Google Drive에서 UT-HAR 처리본 다운로드
+2. 공식 Figshare에서 CSI-HAR 원본 다운로드
+3. 중단된 다운로드가 있으면 가능한 경우 이어받기
+4. ZIP 크기와 CSI-HAR MD5 검증
+5. 안전하게 압축 해제
+6. UT-HAR 배열 shape와 CSI-HAR 방·세션 수 검증
+7. 전체 ESP-Fi/UT-HAR/CSI-HAR 및 CUDA 환경 최종 확인
+
+이미 정상인 데이터셋은 다시 받지 않는다. 다운로드가 끝난 ZIP도 보관하려면 두 번째 명령 대신 다음을 실행한다.
+
+```bat
+..\..\.venv\Scripts\python.exe download_datasets.py --keep-archives
+..\..\.venv\Scripts\python.exe check_environment.py --require-cuda
+```
 
 기본 PyTorch wheel은 CUDA 12.6이다. 설치가 실패하거나 실습실 드라이버와 맞지 않으면 [PyTorch 공식 설치 선택기](https://pytorch.org/get-started/locally/)에서 Windows/Pip/Python과 맞는 CUDA를 선택하고 index URL을 첫 인수로 준다.
 
@@ -141,10 +166,9 @@ setup-lab.bat https://download.pytorch.org/whl/cu128
 
 ## 5. 환경·데이터·테스트 확인
 
-설치 후 다음 세 명령을 실행한다.
+`download-datasets.bat`가 환경·데이터 검사를 이미 실행한다. 이어서 코드 테스트 두 개를 실행한다.
 
 ```bat
-..\..\.venv\Scripts\python.exe check_environment.py --require-cuda
 ..\..\.venv\Scripts\python.exe -m unittest -v test_v5_1.py
 ..\..\.venv\Scripts\python.exe -m unittest discover -s ..\..\gateway\tests -v
 ```
@@ -366,8 +390,9 @@ checkpoint가 없으면 기존 monitor가 그대로 동작하고 행동 분류�
 
 ### 데이터 파일 부족
 
-- 2절의 폴더 이름과 깊이를 그대로 맞춘다.
-- Git clone만으로 raw 데이터는 내려오지 않는다.
+- `download-datasets.bat`를 다시 실행한다. 이미 완료된 데이터는 건너뛴다.
+- Git clone/pull만으로 raw 데이터는 내려오지 않는다.
+- 학교망에서 Google Drive 또는 Figshare가 차단되면 다른 네트워크에서 2절의 폴더 구조로 복사한다.
 - UT-HAR `.csv`를 텍스트로 변환하지 않는다.
 
 ### 중간에 중단됨

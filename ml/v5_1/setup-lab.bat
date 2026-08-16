@@ -19,11 +19,11 @@ popd
 if errorlevel 1 goto :fail
 "%PROJECT_PYTHON%" -m pip install -r requirements.txt
 if errorlevel 1 goto :fail
-"%PROJECT_PYTHON%" check_environment.py --require-cuda
+"%PROJECT_PYTHON%" -c "import torch; print('torch:', torch.__version__); print('CUDA build:', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); assert torch.cuda.is_available(), 'CUDA-enabled PyTorch is not available'"
 if errorlevel 1 goto :fail
-echo v5.1 setup complete.
+echo v5.1 Python and CUDA setup complete.
+echo Next: run download-datasets.bat
 exit /b 0
 :fail
 echo Setup failed. Read LAB_TRAINING.md troubleshooting.
 exit /b 1
-
