@@ -149,6 +149,12 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--baud", type=int, default=2_000_000)
     monitor_parser.add_argument("--project-root", default=".")
 
+    fall_alert_test_parser = subparsers.add_parser(
+        "fall-alert-test", help="Send one test fall event to the app server"
+    )
+    fall_alert_test_parser.add_argument("--server", required=True)
+    fall_alert_test_parser.add_argument("--room-id", default="room-01")
+
     features_parser = subparsers.add_parser(
         "features", help="Build session-level Radar features"
     )
@@ -184,6 +190,24 @@ def build_parser() -> argparse.ArgumentParser:
         dataset_profile_parser.add_argument("--dataset-id", required=True)
         dataset_profile_parser.add_argument("--project-root", default=".")
     return parser
+
+
+def send_test_fall_alert(args: argparse.Namespace) -> int:
+    from .fall_alert import FallAlertError, build_collection_fall_event, send_fall_event
+
+    window_id = f"manual-test-{uuid4().hex}"
+    event = build_collection_fall_event(
+        session_id=window_id,
+        detected_at=utc_now(),
+        room_id=args.room_id,
+    )
+    try:
+        send_fall_event(args.server, event)
+    except (FallAlertError, ValueError) as exc:
+        print(f"테스트 이벤트 전송 실패: {exc}", file=sys.stderr)
+        return 1
+    print(f"앱 서버가 테스트 이벤트를 접수했습니다: {window_id}")
+    return 0
 
 
 def export_features(args: argparse.Namespace) -> int:
@@ -257,6 +281,8 @@ def main(argv: list[str] | None = None) -> int:
         from .monitor import run_monitor
 
         return run_monitor(args.port, args.baud, args.project_root)
+    if args.command == "fall-alert-test":
+        return send_test_fall_alert(args)
     if args.command == "features":
         return export_features(args)
     if args.command.startswith("dataset-"):
