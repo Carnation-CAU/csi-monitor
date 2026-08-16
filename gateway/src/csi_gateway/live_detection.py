@@ -21,6 +21,29 @@ FALL_HISTORY_EVENT_TYPES = {
 }
 
 
+class DetectionSoundPolicy:
+    """Map fall events to audible alert patterns without depending on Qt."""
+
+    def __init__(self, candidate_cooldown_seconds: float = 3.0) -> None:
+        if candidate_cooldown_seconds < 0:
+            raise ValueError("candidate_cooldown_seconds must be non-negative")
+        self.candidate_cooldown_seconds = candidate_cooldown_seconds
+        self._last_candidate_at = -float("inf")
+
+    def beep_count(self, event_type: str, *, now: float) -> int:
+        if event_type == "fall_suspected":
+            return 3
+        if event_type not in {"ml_fall_candidate", "radar_fall_candidate"}:
+            return 0
+        if now - self._last_candidate_at < self.candidate_cooldown_seconds:
+            return 0
+        self._last_candidate_at = now
+        return 1
+
+    def reset(self) -> None:
+        self._last_candidate_at = -float("inf")
+
+
 def format_fall_history_record(record: dict[str, object]) -> str:
     """Render one persisted fall-related record for the monitor history."""
     timestamp = str(record.get("detected_at") or record.get("recorded_at") or "")
@@ -48,6 +71,10 @@ def format_fall_history_record(record: dict[str, object]) -> str:
 
     evidence = record.get("evidence")
     if isinstance(evidence, dict):
+        if evidence.get("simulation"):
+            parts.append("안전 시뮬레이션")
+        if evidence.get("fusion_rule") == "radar_high_confidence_fallback_v1":
+            parts.append("ML 미확인 Radar 보조 경보")
         impact_ratio = evidence.get("impact_ratio")
         if isinstance(impact_ratio, (int, float)):
             parts.append(f"충격비 {float(impact_ratio):.2f}")
@@ -227,6 +254,19 @@ class LiveActionDetector:
         self.impact_at = None
         self.impact_ratio = 0.0
         self.impact_detected_at = None
+
+    def pending_fall_status(self, observed_at: float) -> dict[str, float] | None:
+        if self.impact_at is None:
+            return None
+        elapsed = max(0.0, observed_at - self.impact_at)
+        return {
+            "impact_ratio": self.impact_ratio,
+            "elapsed_seconds": elapsed,
+            "remaining_seconds": max(
+                0.0,
+                self.config.fall_no_recovery_seconds - elapsed,
+            ),
+        }
 
     def update(
         self,

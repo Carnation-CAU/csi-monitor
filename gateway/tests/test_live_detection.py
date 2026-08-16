@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from csi_gateway.live_detection import (
+    DetectionSoundPolicy,
     EventJournal,
     LiveActionDetector,
     LiveDetectionConfig,
@@ -96,6 +97,28 @@ class LiveActionDetectorTests(unittest.TestCase):
         self.assertEqual(fall_events[0].detected_at, "2026-08-16T00:00:00Z")
         self.assertEqual(fall_events[0].evidence["no_recovery_sec"], 3.0)
 
+    def test_exposes_pending_impact_countdown_before_fall_decision(self):
+        detector = LiveActionDetector(
+            config=LiveDetectionConfig(
+                min_samples=99,
+                fall_no_recovery_seconds=3.0,
+            )
+        )
+        detector.update(
+            radar_sample(moving=True, jitter_ratio=4.0),
+            observed_at=10.0,
+            detected_at="2026-08-16T00:00:00Z",
+            presence_state="present",
+            presence_probability=0.9,
+        )
+
+        pending = detector.pending_fall_status(11.5)
+
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["impact_ratio"], 4.0)
+        self.assertEqual(pending["elapsed_seconds"], 1.5)
+        self.assertEqual(pending["remaining_seconds"], 1.5)
+
     def test_continued_movement_cancels_fall_candidate(self):
         detector = LiveActionDetector(
             config=LiveDetectionConfig(
@@ -123,6 +146,21 @@ class LiveActionDetectorTests(unittest.TestCase):
         self.assertFalse(
             any(event.event_type == "fall_suspected" for event in all_events)
         )
+
+
+class DetectionSoundPolicyTests(unittest.TestCase):
+    def test_distinguishes_candidates_final_fall_and_other_events(self):
+        policy = DetectionSoundPolicy(candidate_cooldown_seconds=3.0)
+
+        self.assertEqual(policy.beep_count("ml_fall_candidate", now=0.0), 1)
+        self.assertEqual(policy.beep_count("radar_fall_candidate", now=1.0), 0)
+        self.assertEqual(policy.beep_count("radar_fall_candidate", now=3.1), 1)
+        self.assertEqual(policy.beep_count("fall_suspected", now=3.2), 3)
+        self.assertEqual(policy.beep_count("activity_detected", now=4.0), 0)
+
+    def test_rejects_negative_candidate_cooldown(self):
+        with self.assertRaises(ValueError):
+            DetectionSoundPolicy(candidate_cooldown_seconds=-1.0)
 
 
 class EventJournalTests(unittest.TestCase):
@@ -185,6 +223,7 @@ class EventJournalTests(unittest.TestCase):
                 "confidence": 0.87,
                 "source": "ml_radar_fusion",
                 "evidence": {
+                    "simulation": True,
                     "impact_ratio": 3.2,
                     "no_recovery_sec": 8.0,
                     "ml_fall_score_max": 0.93,
@@ -193,11 +232,30 @@ class EventJournalTests(unittest.TestCase):
         )
 
         self.assertIn("최종 낙상 의심", line)
+        self.assertIn("안전 시뮬레이션", line)
         self.assertIn("신뢰 지표 87.0%", line)
         self.assertIn("충격비 3.20", line)
         self.assertIn("무회복 8.0초", line)
         self.assertIn("ML 93.0%", line)
         self.assertIn("ID fall-1", line)
+
+    def test_formats_radar_only_fallback_as_ml_unconfirmed(self):
+        line = format_fall_history_record(
+            {
+                "event_type": "fall_suspected",
+                "detected_at": "2026-08-16T12:01:00+09:00",
+                "event_id": "radar-fallback-1",
+                "confidence": 0.96,
+                "source": "radar_high_confidence_fallback",
+                "evidence": {
+                    "fusion_rule": "radar_high_confidence_fallback_v1",
+                    "impact_ratio": 8.4,
+                    "no_recovery_sec": 8.2,
+                },
+            }
+        )
+
+        self.assertIn("ML 미확인 Radar 보조 경보", line)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@ import json
 import os
 import platform
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 from time import monotonic
@@ -34,6 +34,7 @@ from .fall_alert import (
     send_fall_event,
 )
 from .live_detection import (
+    DetectionSoundPolicy,
     DetectionEvent,
     EventJournal,
     FALL_HISTORY_EVENT_TYPES,
@@ -81,6 +82,7 @@ from .radar import (
 from .prototype import predict_action
 from .activity import (
     ActivityFrame,
+    ActivityPrediction,
     ActivityPredictionDisplaySmoother,
     AsyncFrameWindowEngine,
 )
@@ -115,7 +117,9 @@ def run_monitor(
         QPushButton,
         QPlainTextEdit,
         QHBoxLayout,
+        QSplitter,
         QSpinBox,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -195,7 +199,8 @@ def run_monitor(
         def __init__(self) -> None:
             super().__init__()
             self.setWindowTitle(f"ESP32 CSI Movement Monitor - {port}")
-            self.resize(1050, 780)
+            self.resize(1280, 820)
+            self.setMinimumSize(1000, 700)
             self.project_root = Path(project_root).resolve()
             self.active_profile = load_or_create_profile(self.project_root)
             self.presence_detector = PresenceDetector()
@@ -203,8 +208,14 @@ def run_monitor(
             self.event_journal = EventJournal(self.project_root)
             self.live_detector = self.build_live_detector()
 
-            self.jitter_values: deque[float] = deque(maxlen=100)
-            self.threshold_values: deque[float] = deque(maxlen=100)
+            self.plot_history_seconds = 10 * 60.0
+            self.plot_live_window_seconds = 25.0
+            self.plot_follow_live = True
+            self.jitter_values: deque[float] = deque()
+            self.threshold_values: deque[float] = deque()
+            self.radar_sample_times: deque[float] = deque()
+            self.detection_timeline_events: list[dict[str, object]] = []
+            self.last_timeline_ml_label: str | None = None
             self.sample_count = 0
             self.started_at = monotonic()
             self.last_sample_at = 0.0
@@ -285,24 +296,34 @@ def run_monitor(
             self.collection_safety_confirmed: bool | None = None
             self.fall_alert_workers: list[FallAlertWorker] = []
             self.pending_fall_alerts: dict[str, dict[str, object]] = {}
+            self.fusion_candidate_kind: str | None = None
+            self.fusion_candidate_at: float | None = None
+            self.fusion_correlation_seconds = 15.0
+            self.radar_pending_visible = False
+            self.detection_sound_policy = DetectionSoundPolicy(
+                candidate_cooldown_seconds=3.0
+            )
 
             self.status = QLabel("WAITING FOR RADAR DATA")
             self.status.setAlignment(Qt.AlignCenter)
-            self.status.setFont(QFont("Arial", 28, QFont.Bold))
+            self.status.setFont(QFont("Arial", 24, QFont.Bold))
+            self.status.setMaximumHeight(92)
             self.status.setStyleSheet(
-                "background:#343a40;color:white;padding:18px;border-radius:8px;"
+                "background:#343a40;color:white;padding:14px;border-radius:8px;"
             )
 
             self.presence_status = QLabel("재실 상태: 판단 대기")
             self.presence_status.setAlignment(Qt.AlignCenter)
-            self.presence_status.setFont(QFont("Arial", 15, QFont.Bold))
+            self.presence_status.setFont(QFont("Arial", 12, QFont.Bold))
+            self.presence_status.setWordWrap(True)
             self.presence_status.setStyleSheet(
-                "background:#b54708;color:white;padding:12px;border-radius:6px;"
+                "background:#b54708;color:white;padding:10px;border-radius:6px;"
             )
 
             self.action_status = QLabel("자동 행동 감지: 보정 후 자동 시작")
             self.action_status.setAlignment(Qt.AlignCenter)
-            self.action_status.setFont(QFont("Arial", 13, QFont.Bold))
+            self.action_status.setFont(QFont("Arial", 11, QFont.Bold))
+            self.action_status.setWordWrap(True)
             self.action_status.setStyleSheet(
                 "background:#495057;color:white;padding:10px;border-radius:6px;"
             )
@@ -310,12 +331,55 @@ def run_monitor(
             self.fall_history = QPlainTextEdit()
             self.fall_history.setReadOnly(True)
             self.fall_history.setMaximumBlockCount(100)
-            self.fall_history.setMaximumHeight(145)
+            self.fall_history.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+            self.fall_history.setMinimumSize(360, 340)
+            self.fall_history.setFont(QFont("Arial", 10))
             self.fall_history.setPlaceholderText("아직 기록된 낙상 후보가 없습니다.")
+            self.event_log_status = QLabel(
+                "자동 감지·알림 이벤트는 data/events/YYYY-MM-DD.jsonl에 "
+                "날짜별 저장됩니다. 원시 CSI 수집 파일과는 별개입니다."
+            )
+            self.event_log_status.setWordWrap(True)
+            self.event_log_status.setStyleSheet(
+                "background:#eef2f6;color:#344054;padding:8px;border-radius:5px;"
+            )
+            self.fusion_diagnostic_status = QLabel(
+                "융합 진단: ML과 Radar 낙상 후보 대기"
+            )
+            self.fusion_diagnostic_status.setWordWrap(True)
+            self.fusion_diagnostic_status.setStyleSheet(
+                "background:#f2f4f7;color:#344054;padding:8px;border-radius:5px;"
+            )
+            self.fall_sound_checkbox = QCheckBox("낙상 후보·최종 감지 소리")
+            self.fall_sound_checkbox.setChecked(True)
+            self.fall_sound_checkbox.setToolTip(
+                "낙상 후보는 1회, ML+Radar 최종 낙상 의심은 3회 울립니다."
+            )
+            self.radar_fallback_checkbox = QCheckBox(
+                "실험적 Radar 단독 보조 알림"
+            )
+            self.radar_fallback_checkbox.setChecked(
+                False
+            )
+            self.radar_fallback_checkbox.setEnabled(
+                self.activity_aggregator is not None
+            )
+            self.radar_fallback_checkbox.setToolTip(
+                "ML 후보가 없어도 Radar 90% 이상, 충격비 5 이상, 8초 무회복이면 "
+                "15초 대기 후 낙상 보조 경보를 전송합니다. 오탐 가능성이 있습니다."
+            )
+            self.radar_fallback_checkbox.toggled.connect(
+                self.set_radar_fallback_enabled
+            )
             fall_history_layout = QVBoxLayout()
+            fall_history_layout.addWidget(self.event_log_status)
+            fall_history_layout.addWidget(self.fusion_diagnostic_status)
+            fall_history_layout.addWidget(self.fall_sound_checkbox)
+            fall_history_layout.addWidget(self.radar_fallback_checkbox)
             fall_history_layout.addWidget(self.fall_history)
             fall_history_group = QGroupBox("최근 낙상 후보·감지 기록 (최신순)")
             fall_history_group.setLayout(fall_history_layout)
+            fall_history_group.setMinimumWidth(390)
             self.refresh_fall_history()
 
             if self.activity_model_error:
@@ -329,7 +393,8 @@ def run_monitor(
                 )
             self.activity_status = QLabel(activity_text)
             self.activity_status.setAlignment(Qt.AlignCenter)
-            self.activity_status.setFont(QFont("Arial", 13, QFont.Bold))
+            self.activity_status.setFont(QFont("Arial", 11, QFont.Bold))
+            self.activity_status.setWordWrap(True)
             self.activity_status.setStyleSheet(
                 "background:#495057;color:white;padding:10px;border-radius:6px;"
             )
@@ -355,6 +420,11 @@ def run_monitor(
             self.profile_status = QLabel()
             self.profile_status.setFont(QFont("Arial", 11, QFont.Bold))
             self.profile_combo = QComboBox()
+            self.profile_channel_combo = QComboBox()
+            for channel_option in (1, 6, 11):
+                self.profile_channel_combo.addItem(
+                    f"채널 {channel_option}", channel_option
+                )
             self.refresh_profile_list(self.active_profile["profileId"])
             self.profile_combo.currentIndexChanged.connect(self.select_space_profile)
             self.profile_add_button = QPushButton("새 프로필 추가")
@@ -366,6 +436,16 @@ def run_monitor(
             self.profile_apply_button = QPushButton("공간 프로필 적용")
             self.profile_apply_button.setFont(QFont("Arial", 11, QFont.Bold))
             self.profile_apply_button.clicked.connect(self.apply_space_profile)
+            self.profile_channel_apply_button = QPushButton("채널 저장·적용")
+            self.profile_channel_apply_button.clicked.connect(
+                self.apply_selected_profile_channel
+            )
+            self.profile_channel_calibrate_button = QPushButton(
+                "선택 채널 빈방 보정 (약 40초)"
+            )
+            self.profile_channel_calibrate_button.clicked.connect(
+                self.calibrate_selected_profile_channel
+            )
 
             profile_controls = QHBoxLayout()
             profile_controls.addWidget(self.profile_combo, 1)
@@ -373,8 +453,17 @@ def run_monitor(
             profile_controls.addWidget(self.profile_edit_button)
             profile_controls.addWidget(self.profile_delete_button)
             profile_controls.addWidget(self.profile_apply_button)
+            profile_channel_controls = QHBoxLayout()
+            profile_channel_controls.addWidget(QLabel("프로필 고정 Wi-Fi 채널"))
+            profile_channel_controls.addWidget(self.profile_channel_combo)
+            profile_channel_controls.addWidget(self.profile_channel_apply_button)
+            profile_channel_controls.addWidget(
+                self.profile_channel_calibrate_button
+            )
+            profile_channel_controls.addStretch(1)
             profile_layout = QVBoxLayout()
             profile_layout.addLayout(profile_controls)
+            profile_layout.addLayout(profile_channel_controls)
             profile_layout.addWidget(self.profile_status)
             profile_group = QGroupBox("공간 프로필")
             profile_group.setLayout(profile_layout)
@@ -441,7 +530,10 @@ def run_monitor(
 
             self.fall_alert_endpoint = QLineEdit()
             self.fall_alert_endpoint.setText(
-                os.environ.get("CARNATION_EVENT_API_URL", "")
+                os.environ.get(
+                    "CARNATION_EVENT_API_URL",
+                    "http://localhost:8080",
+                )
             )
             self.fall_alert_endpoint.setPlaceholderText(
                 "앱 서버 주소 (예: http://192.168.0.5:8080)"
@@ -449,61 +541,208 @@ def run_monitor(
             self.fall_alert_test_button = QPushButton("앱 알림 테스트")
             self.fall_alert_test_button.setFont(QFont("Arial", 10, QFont.Bold))
             self.fall_alert_test_button.clicked.connect(self.send_manual_fall_alert_test)
+            self.safe_detection_test_button = QPushButton(
+                "알림 경로 시뮬레이션 (센서 제외)"
+            )
+            self.safe_detection_test_button.setFont(QFont("Arial", 10, QFont.Bold))
+            self.safe_detection_test_button.setToolTip(
+                "실제 몸 동작 없이 Radar→ML 양방향 융합과 경고음을 즉시 시험합니다. "
+                "서버 주소가 있으면 테스트 알림도 전송합니다."
+            )
+            self.safe_detection_test_button.clicked.connect(
+                self.run_safe_fall_detection_simulation
+            )
 
             self.collection_start_button = QPushButton("행동 수집 시작")
             self.collection_start_button.setFont(QFont("Arial", 11, QFont.Bold))
             self.collection_start_button.clicked.connect(self.start_collection)
             self.collection_status = QLabel("수집 대기")
 
-            collection_controls = QHBoxLayout()
-            collection_controls.addWidget(self.collection_label_combo)
-            collection_controls.addWidget(self.collection_prep_spin)
-            collection_controls.addWidget(self.collection_duration_spin)
-            collection_controls.addWidget(self.collection_cue_checkbox)
-            collection_controls.addWidget(self.collection_cue_spin)
-            collection_controls.addWidget(self.collection_fall_safety_checkbox)
-            collection_controls.addWidget(self.collection_start_button)
+            collection_primary_controls = QHBoxLayout()
+            collection_primary_controls.addWidget(self.collection_label_combo, 1)
+            collection_primary_controls.addWidget(self.collection_prep_spin)
+            collection_primary_controls.addWidget(self.collection_duration_spin)
+            collection_primary_controls.addWidget(self.collection_start_button)
+            collection_option_controls = QHBoxLayout()
+            collection_option_controls.addWidget(self.collection_cue_checkbox)
+            collection_option_controls.addWidget(self.collection_cue_spin)
+            collection_option_controls.addWidget(self.collection_fall_safety_checkbox)
+            collection_option_controls.addStretch(1)
             collection_layout = QVBoxLayout()
-            collection_layout.addLayout(collection_controls)
+            collection_layout.addLayout(collection_primary_controls)
+            collection_layout.addLayout(collection_option_controls)
             fall_alert_layout = QHBoxLayout()
             fall_alert_layout.addWidget(QLabel("낙상 알림 서버"))
             fall_alert_layout.addWidget(self.fall_alert_endpoint, 1)
             fall_alert_layout.addWidget(self.fall_alert_test_button)
+            fall_alert_layout.addWidget(self.safe_detection_test_button)
             collection_layout.addLayout(fall_alert_layout)
             collection_layout.addWidget(self.collection_status)
             collection_group = QGroupBox("행동 데이터 수집")
             collection_group.setLayout(collection_layout)
 
-            self.plot = pg.PlotWidget(title="Movement signal (jitter)")
+            self.plot = pg.PlotWidget(
+                title="움직임 신호(jitter) + 감지 행동 타임라인",
+                axisItems={"bottom": pg.DateAxisItem(orientation="bottom")},
+            )
+            self.plot.setMinimumSize(600, 360)
             self.plot.setBackground("#101214")
             self.plot.showGrid(x=True, y=True, alpha=0.3)
             self.plot.addLegend()
-            self.plot.setXRange(0, 100, padding=0)
-            self.plot.setLimits(xMin=0, xMax=100)
-            self.plot.setMouseEnabled(x=False, y=True)
+            self.plot.setLabel("bottom", "시각")
+            plot_now = datetime.now(timezone.utc).timestamp()
+            self.plot.setXRange(
+                plot_now - self.plot_live_window_seconds,
+                plot_now,
+                padding=0,
+            )
+            self.plot.setMouseEnabled(x=True, y=True)
             self.jitter_curve = self.plot.plot(
-                pen=pg.mkPen("#20e070", width=2), name="jitter"
+                pen=pg.mkPen("#20e070", width=2),
+                name="CSI 변화량 (jitter)",
             )
             self.threshold_curve = self.plot.plot(
-                pen=pg.mkPen("#ff40e0", width=2), name="move threshold"
+                pen=pg.mkPen("#ff40e0", width=2),
+                name="움직임 기준선 (threshold)",
+            )
+            self.detection_timeline_scatter = pg.ScatterPlotItem(pxMode=True)
+            self.detection_timeline_scatter.setZValue(20)
+            self.plot.addItem(self.detection_timeline_scatter)
+
+            self.plot_follow_checkbox = QCheckBox("실시간 따라가기")
+            self.plot_follow_checkbox.setChecked(True)
+            self.plot_follow_checkbox.toggled.connect(self.set_plot_follow_live)
+            self.plot_previous_button = QPushButton("← 이전 30초")
+            self.plot_previous_button.clicked.connect(
+                lambda: self.shift_plot_history(-30.0)
+            )
+            self.plot_next_button = QPushButton("다음 30초 →")
+            self.plot_next_button.clicked.connect(
+                lambda: self.shift_plot_history(30.0)
+            )
+            self.plot_live_button = QPushButton("현재로")
+            self.plot_live_button.clicked.connect(self.return_plot_to_live)
+            self.plot_history_status = QLabel("실시간 · 최근 10분 보관")
+            self.plot_metric_guide = QLabel(
+                "<b>선</b> · <span style='color:#087f3d'><b>초록 Jitter</b></span>: "
+                "CSI 단기 변화량 · <span style='color:#c218a8'><b>자홍 Threshold</b>"
+                "</span>: Radar 움직임 기준선<br>"
+                "<b>행동(알림 없음)</b> · 회색 정지 · 초록 움직임 · 파랑 ML 보행 · "
+                "보라 ML 기타 · 분홍 오각형 ML 낙상성 분류: 모델의 화면용 중간 판단<br>"
+                "<b>낙상 후보(서버 알림 없음)</b> · 파랑 ML 후보 / 주황 Radar 후보: "
+                "서로 15초 동안 짝이 되는 후보를 기다림 · 후보음 1회<br>"
+                "<b>최종 경보</b> · 빨강 × 최종 낙상: ML+Radar 결합, 경고음 3회와 "
+                "서버 알림 · 주황 × Radar 보조 낙상: 실험 옵션을 켰을 때만 단독 경보 "
+                "<b>(×는 실패 표시가 아니라 최종 경보 위치 표시)</b>"
+            )
+            self.plot_metric_guide.setTextFormat(Qt.RichText)
+            self.plot_metric_guide.setWordWrap(True)
+            self.plot_metric_guide.setStyleSheet(
+                "background:#f2f4f7;color:#344054;padding:8px;"
+                "border:1px solid #d0d5dd;border-radius:5px;"
+            )
+            plot_controls = QHBoxLayout()
+            plot_controls.addWidget(self.plot_follow_checkbox)
+            plot_controls.addWidget(self.plot_previous_button)
+            plot_controls.addWidget(self.plot_next_button)
+            plot_controls.addWidget(self.plot_live_button)
+            plot_controls.addStretch(1)
+            plot_controls.addWidget(self.plot_history_status)
+            plot_panel_layout = QVBoxLayout()
+            plot_panel_layout.setContentsMargins(0, 0, 0, 0)
+            plot_panel_layout.addLayout(plot_controls)
+            plot_panel_layout.addWidget(self.plot_metric_guide)
+            plot_panel_layout.addWidget(self.plot, 1)
+            plot_panel = QWidget()
+            plot_panel.setLayout(plot_panel_layout)
+            self.plot.getViewBox().sigRangeChangedManually.connect(
+                self.pause_plot_follow
             )
 
+            status_cards = QHBoxLayout()
+            status_cards.setSpacing(8)
+            for status_card in (
+                self.presence_status,
+                self.action_status,
+                self.activity_status,
+            ):
+                status_card.setMinimumHeight(68)
+                status_cards.addWidget(status_card, 1)
+
+            realtime_splitter = QSplitter(Qt.Horizontal)
+            realtime_splitter.setChildrenCollapsible(False)
+            realtime_splitter.addWidget(plot_panel)
+            realtime_splitter.addWidget(fall_history_group)
+            realtime_splitter.setStretchFactor(0, 3)
+            realtime_splitter.setStretchFactor(1, 2)
+            realtime_splitter.setSizes([780, 440])
+
+            connection_layout = QVBoxLayout()
+            connection_statuses = QHBoxLayout()
+            self.link_status.setWordWrap(True)
+            self.channel_status.setWordWrap(True)
+            connection_statuses.addWidget(self.link_status, 2)
+            connection_statuses.addWidget(self.channel_status, 1)
+            connection_layout.addLayout(connection_statuses)
+            connection_layout.addWidget(self.details)
+            connection_group = QGroupBox("장치 연결 상태")
+            connection_group.setLayout(connection_layout)
+
+            monitor_layout = QVBoxLayout()
+            monitor_layout.setContentsMargins(12, 12, 12, 12)
+            monitor_layout.setSpacing(10)
+            monitor_layout.addWidget(self.status)
+            monitor_layout.addLayout(status_cards)
+            monitor_layout.addWidget(realtime_splitter, 1)
+            monitor_layout.addWidget(connection_group)
+            monitor_tab = QWidget()
+            monitor_tab.setLayout(monitor_layout)
+
+            space_intro = QLabel(
+                "채널 비교와 빈 공간 보정, 공간 프로필 및 참조 데이터셋을 "
+                "관리합니다. 평상시 모니터링에는 이 탭을 열어둘 필요가 없습니다."
+            )
+            space_intro.setWordWrap(True)
+            space_intro.setStyleSheet(
+                "background:#eef2f6;color:#344054;padding:10px;border-radius:6px;"
+            )
+            space_layout = QVBoxLayout()
+            space_layout.setContentsMargins(14, 14, 14, 14)
+            space_layout.setSpacing(12)
+            space_layout.addWidget(space_intro)
+            space_layout.addWidget(self.channel_scan_button)
+            space_layout.addWidget(profile_group)
+            space_layout.addWidget(dataset_group)
+            space_layout.addStretch(1)
+            space_tab = QWidget()
+            space_tab.setLayout(space_layout)
+
+            collection_intro = QLabel(
+                "학습·검증용 행동 데이터를 의도적으로 저장할 때만 사용합니다. "
+                "실시간 모니터링은 이 기능을 시작하지 않아도 동작합니다."
+            )
+            collection_intro.setWordWrap(True)
+            collection_intro.setStyleSheet(
+                "background:#fff4e5;color:#7a2e0e;padding:10px;border-radius:6px;"
+            )
+            collection_tab_layout = QVBoxLayout()
+            collection_tab_layout.setContentsMargins(14, 14, 14, 14)
+            collection_tab_layout.setSpacing(12)
+            collection_tab_layout.addWidget(collection_intro)
+            collection_tab_layout.addWidget(collection_group)
+            collection_tab_layout.addStretch(1)
+            collection_tab = QWidget()
+            collection_tab.setLayout(collection_tab_layout)
+
+            tabs = QTabWidget()
+            tabs.setDocumentMode(True)
+            tabs.addTab(monitor_tab, "실시간 모니터링")
+            tabs.addTab(space_tab, "공간 설정 · 데이터셋")
+            tabs.addTab(collection_tab, "행동 데이터 수집")
+
             layout = QVBoxLayout()
-            layout.addWidget(self.status)
-            layout.addWidget(self.presence_status)
-            layout.addWidget(self.action_status)
-            layout.addWidget(self.activity_status)
-            layout.addWidget(fall_history_group)
-            layout.addWidget(self.link_status)
-            layout.addWidget(self.channel_status)
-            layout.addWidget(self.details)
-            button_layout = QHBoxLayout()
-            button_layout.addWidget(self.channel_scan_button)
-            layout.addLayout(button_layout)
-            layout.addWidget(profile_group)
-            layout.addWidget(dataset_group)
-            layout.addWidget(collection_group)
-            layout.addWidget(self.plot, 1)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(tabs)
             container = QWidget()
             container.setLayout(layout)
             self.setCentralWidget(container)
@@ -541,6 +780,12 @@ def run_monitor(
 
         def refresh_profile_status(self) -> None:
             channel = self.active_profile["radio"]["channel"]
+            if hasattr(self, "profile_channel_combo"):
+                selected_index = self.profile_channel_combo.findData(int(channel))
+                if selected_index >= 0:
+                    self.profile_channel_combo.blockSignals(True)
+                    self.profile_channel_combo.setCurrentIndex(selected_index)
+                    self.profile_channel_combo.blockSignals(False)
             if self.active_profile.get("needsCalibration", True):
                 calibration = "보정값 없음"
             else:
@@ -981,6 +1226,89 @@ def run_monitor(
                 "30초 정지 후 STATIC, 움직인 뒤 MOVEMENT DETECTED인지 확인해 주세요.",
             )
 
+        def selected_profile_channel(self) -> int:
+            channel = self.profile_channel_combo.currentData()
+            return int(channel)
+
+        def apply_selected_profile_channel(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
+            selected_channel = self.selected_profile_channel()
+            saved_channel = int(self.active_profile["radio"]["channel"])
+            channel_changed = selected_channel != saved_channel
+            if channel_changed:
+                calibration_warning = (
+                    "기존 빈방 보정값은 삭제되고 다시 보정해야 합니다.\n"
+                    "이미 수집한 세션은 보존되지만 새 채널 데이터와 섞어 "
+                    "판정 기준을 만들면 안 됩니다.\n\n"
+                )
+                reply = QMessageBox.question(
+                    self,
+                    "프로필 채널 변경",
+                    f"저장 채널을 {saved_channel}에서 {selected_channel}(으)로 "
+                    "변경할까요?\n\n{calibration_warning}",
+                    QMessageBox.Yes | QMessageBox.Cancel,
+                    QMessageBox.Cancel,
+                )
+                if reply != QMessageBox.Yes:
+                    self.refresh_profile_status()
+                    return
+                update_profile_channel(
+                    self.project_root,
+                    self.active_profile,
+                    selected_channel,
+                )
+                self.refresh_presence_baseline()
+                self.show_presence(
+                    self.presence_detector.reset("calibration_required")
+                )
+                self.refresh_profile_status()
+
+            self.reader.send_command(f"rf_channel --set {selected_channel}")
+            message = f"TX/RX에 채널 {selected_channel} 전환 명령을 보냈습니다."
+            if channel_changed:
+                message += (
+                    "\n데이터 수집 전에 '선택 채널 빈방 보정'을 실행하세요."
+                )
+            elif self.active_profile.get("needsCalibration", True):
+                message += "\n저장된 보정값이 없으므로 빈방 보정이 필요합니다."
+            else:
+                message += "\n저장된 보정값은 '공간 프로필 적용'에서 적용됩니다."
+            QMessageBox.information(self, "프로필 채널 적용", message)
+
+        def calibrate_selected_profile_channel(self) -> None:
+            if self.calibrating or self.scanning_channels or self.collecting:
+                return
+            selected_channel = self.selected_profile_channel()
+            saved_channel = int(self.active_profile["radio"]["channel"])
+            reply = QMessageBox.question(
+                self,
+                "선택 채널 빈방 보정",
+                f"프로필 채널을 {selected_channel}(으)로 저장하고 TX/RX를 "
+                "전환한 뒤 빈방 보정을 실행합니다.\n"
+                "채널이 바뀌면 기존 보정값은 삭제됩니다.\n\n"
+                "10초 안에 방을 나간 뒤 30초 동안 사람·문·커튼·보드를 "
+                "움직이지 않겠습니까?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                self.refresh_profile_status()
+                return
+
+            self.reader.send_command(f"rf_channel --set {selected_channel}")
+            self.integrated_calibration = False
+            self.integrated_channel_summary.clear()
+            self.begin_empty_room_calibration(
+                delay_seconds=10,
+                channel=selected_channel,
+                integrated=False,
+            )
+            if selected_channel != saved_channel:
+                self.channel_status.setText(
+                    f"채널 {selected_channel} 전환·빈방 보정 진행 중"
+                )
+
         def update_collection_cue_default(self, label: str) -> None:
             self.collection_cue_checkbox.setChecked(label in TRANSITION_LABELS)
             self.collection_fall_safety_checkbox.setChecked(label in FALL_LABELS)
@@ -1002,12 +1330,16 @@ def run_monitor(
             self.collection_start_button.setEnabled(enabled)
             self.fall_alert_endpoint.setEnabled(enabled)
             self.fall_alert_test_button.setEnabled(enabled)
+            self.safe_detection_test_button.setEnabled(enabled)
             self.channel_scan_button.setEnabled(enabled)
             self.profile_combo.setEnabled(enabled)
             self.profile_add_button.setEnabled(enabled)
             self.profile_edit_button.setEnabled(enabled)
             self.profile_delete_button.setEnabled(enabled)
             self.profile_apply_button.setEnabled(enabled)
+            self.profile_channel_combo.setEnabled(enabled)
+            self.profile_channel_apply_button.setEnabled(enabled)
+            self.profile_channel_calibrate_button.setEnabled(enabled)
             self.dataset_combo.setEnabled(enabled)
             self.dataset_export_button.setEnabled(enabled)
             self.dataset_import_button.setEnabled(enabled)
@@ -1208,6 +1540,7 @@ def run_monitor(
                 self.activity_engine.deactivate(clear_frames=True)
                 self.activity_display.reset()
                 self.has_activity_prediction = False
+                self.last_timeline_ml_label = None
                 if self.activity_aggregator is not None:
                     self.activity_aggregator.reset()
                 paused_text = "행동 분류: 보정·수집 중 일시 정지"
@@ -1275,6 +1608,7 @@ def run_monitor(
                     if self.has_activity_prediction:
                         self.activity_display.reset()
                         self.has_activity_prediction = False
+                        self.last_timeline_ml_label = None
                     self.activity_status.setText(
                         "행동 분류: 모델 준비됨 · Radar 움직임 대기"
                     )
@@ -1293,13 +1627,14 @@ def run_monitor(
             if display is None:
                 return
             label, averaged_scores = display
+            self.record_ml_timeline_transition(label)
             scores = " · ".join(
                 f"{name} {value * 100:.0f}%"
                 for name, value in averaged_scores.items()
             )
             self.has_activity_prediction = True
             self.activity_status.setText(
-                f"행동 분류(최근 5회 평균 · 5초 유지): {label} · {scores}"
+                f"행동 분류(실험 ML · 최근 5회 평균 · 5초 유지): {label} · {scores}"
             )
             color = "#b42318" if label == "fall_suspected" else "#175cd3"
             self.activity_status.setStyleSheet(
@@ -1514,7 +1849,258 @@ def run_monitor(
             )
             self.start_fall_alert_delivery(endpoint, event, "모의 낙상 수집 완료")
 
+        def set_plot_follow_live(self, enabled: bool) -> None:
+            self.plot_follow_live = enabled
+            if enabled:
+                self.scroll_plot_to_live()
+            else:
+                self.update_plot_history_status()
+
+        def pause_plot_follow(self, *_args: object) -> None:
+            if self.plot_follow_checkbox.isChecked():
+                self.plot_follow_checkbox.setChecked(False)
+
+        def return_plot_to_live(self) -> None:
+            self.plot_follow_checkbox.setChecked(True)
+            self.scroll_plot_to_live()
+
+        def scroll_plot_to_live(self) -> None:
+            latest_at = (
+                self.radar_sample_times[-1]
+                if self.radar_sample_times
+                else datetime.now(timezone.utc).timestamp()
+            )
+            self.plot.setXRange(
+                latest_at - self.plot_live_window_seconds,
+                latest_at,
+                padding=0,
+            )
+            self.update_plot_history_status()
+
+        def shift_plot_history(self, seconds: float) -> None:
+            if not self.radar_sample_times:
+                return
+            self.plot_follow_checkbox.setChecked(False)
+            current_min, current_max = self.plot.viewRange()[0]
+            width = max(5.0, current_max - current_min)
+            earliest_at = self.radar_sample_times[0]
+            latest_at = self.radar_sample_times[-1]
+            target_min = current_min + seconds
+            target_max = current_max + seconds
+            if target_min < earliest_at:
+                target_min = earliest_at
+                target_max = min(latest_at, target_min + width)
+            if target_max > latest_at:
+                target_max = latest_at
+                target_min = max(earliest_at, target_max - width)
+            self.plot.setXRange(target_min, target_max, padding=0)
+            self.update_plot_history_status()
+
+        def update_plot_history_status(self) -> None:
+            if self.plot_follow_live:
+                self.plot_history_status.setText("실시간 · 최근 10분 보관")
+                return
+            visible_min, visible_max = self.plot.viewRange()[0]
+            start = datetime.fromtimestamp(visible_min).strftime("%H:%M:%S")
+            end = datetime.fromtimestamp(visible_max).strftime("%H:%M:%S")
+            self.plot_history_status.setText(
+                f"과거 보기 {start}–{end} · 최근 10분 보관"
+            )
+
+        def add_detection_timeline_marker(
+            self,
+            *,
+            marker_at: float,
+            label: str,
+            color: str,
+            symbol: str,
+            lane: int,
+        ) -> None:
+            symbol_glyph = {
+                "o": "●",
+                "t": "▼",
+                "d": "◆",
+                "p": "⬟",
+                "s": "■",
+                "x": "×",
+            }.get(symbol, "•")
+            text_item = pg.TextItem(
+                f"{symbol_glyph} {label}",
+                color=color,
+                anchor=(0.5, 1.0),
+            )
+            text_item.setZValue(21)
+            self.plot.addItem(text_item)
+            self.detection_timeline_events.append(
+                {
+                    "marker_at": marker_at,
+                    "label": label,
+                    "color": color,
+                    "symbol": symbol,
+                    "lane": lane,
+                    "text_item": text_item,
+                }
+            )
+            while len(self.detection_timeline_events) > 500:
+                removed = self.detection_timeline_events.pop(0)
+                self.plot.removeItem(removed["text_item"])
+            self.refresh_detection_timeline()
+
+        @staticmethod
+        def event_epoch_time(detected_at: str) -> float:
+            try:
+                detected = datetime.fromisoformat(detected_at.replace("Z", "+00:00"))
+                if detected.tzinfo is None:
+                    return datetime.now(timezone.utc).timestamp()
+                return detected.timestamp()
+            except ValueError:
+                return datetime.now(timezone.utc).timestamp()
+
+        def record_detection_timeline_event(self, event: DetectionEvent) -> None:
+            if event.evidence.get("simulation"):
+                return
+            style: tuple[str, str, str, int] | None = None
+            if event.event_type == "activity_detected" and event.label == "moving":
+                style = ("움직임", "#20e070", "t", 1)
+            elif event.event_type == "activity_detected" and event.label == "static":
+                style = ("정지", "#b7bec8", "o", 0)
+            elif event.event_type == "ml_fall_candidate":
+                style = ("ML 낙상 후보", "#4da3ff", "d", 5)
+            elif event.event_type == "radar_fall_candidate":
+                style = ("Radar 낙상 후보", "#ff9f43", "s", 6)
+            elif event.event_type == "fall_suspected":
+                if event.source == "radar_high_confidence_fallback":
+                    style = ("Radar 보조 낙상", "#ff6f3c", "x", 7)
+                else:
+                    style = ("최종 낙상", "#ff4d4f", "x", 8)
+            if style is None:
+                return
+            self.add_detection_timeline_marker(
+                marker_at=self.event_epoch_time(event.detected_at),
+                label=style[0],
+                color=style[1],
+                symbol=style[2],
+                lane=style[3],
+            )
+
+        def record_ml_timeline_transition(self, label: str) -> None:
+            if label == self.last_timeline_ml_label:
+                return
+            self.last_timeline_ml_label = label
+            styles = {
+                "walking": ("ML 보행", "#70a7ff", "t", 2),
+                "other_motion": ("ML 기타 움직임", "#b388ff", "d", 3),
+                "fall_suspected": (
+                    "ML 낙상성 분류(중간)",
+                    "#ff6b6b",
+                    "p",
+                    4,
+                ),
+            }
+            style = styles.get(label)
+            if style is None:
+                return
+            self.add_detection_timeline_marker(
+                marker_at=datetime.now(timezone.utc).timestamp(),
+                label=style[0],
+                color=style[1],
+                symbol=style[2],
+                lane=style[3],
+            )
+
+        def refresh_detection_timeline(self) -> None:
+            if not self.radar_sample_times:
+                self.detection_timeline_scatter.setData(spots=[])
+                return
+            first_at = self.radar_sample_times[0]
+            latest_at = self.radar_sample_times[-1]
+            retained: list[dict[str, object]] = []
+            points: list[dict[str, object]] = []
+            signal_max = max(
+                [*self.jitter_values, *self.threshold_values, 0.000001]
+            )
+            marker_base_y = signal_max * 1.04
+            marker_lane_step = max(signal_max * 0.045, 0.0000005)
+            visible_markers: list[dict[str, object]] = []
+            for marker in self.detection_timeline_events:
+                marker_at = float(marker["marker_at"])
+                text_item = marker["text_item"]
+                if marker_at < first_at:
+                    self.plot.removeItem(text_item)
+                    continue
+                retained.append(marker)
+                if marker_at > latest_at + 0.5:
+                    text_item.setVisible(False)
+                    continue
+                visible_markers.append(marker)
+
+            # Keep each event type on a predictable base lane, then place
+            # temporally adjacent labels in the nearest free compact lane.
+            # Wrapping inside a bounded lane set prevents repeated transitions
+            # from making the timeline unnecessarily tall.
+            last_marker_at_by_lane: dict[int, float] = {}
+            collision_window_seconds = 4.0
+            max_display_lane = 10
+            for marker in sorted(
+                visible_markers, key=lambda item: float(item["marker_at"])
+            ):
+                marker_at = float(marker["marker_at"])
+                preferred_lane = min(int(marker["lane"]), max_display_lane)
+                lane_candidates = [
+                    *range(preferred_lane, max_display_lane + 1),
+                    *range(0, preferred_lane),
+                ]
+                display_lane = next(
+                    (
+                        lane
+                        for lane in lane_candidates
+                        if lane not in last_marker_at_by_lane
+                        or marker_at - last_marker_at_by_lane[lane]
+                        >= collision_window_seconds
+                    ),
+                    min(
+                        lane_candidates,
+                        key=lambda lane: last_marker_at_by_lane.get(
+                            lane, -float("inf")
+                        ),
+                    ),
+                )
+                last_marker_at_by_lane[display_lane] = marker_at
+                x_value = marker_at
+                y_value = marker_base_y + display_lane * marker_lane_step
+                text_item.setPos(x_value, y_value)
+                text_item.setVisible(True)
+                # TextItem does not reliably contribute to PlotWidget's data
+                # bounds. Keep an invisible point at the same coordinate so
+                # auto-range leaves enough room for the combined glyph+label.
+                points.append(
+                    {
+                        "pos": (
+                            x_value,
+                            y_value + marker_lane_step * 1.5,
+                        ),
+                        "brush": pg.mkBrush(0, 0, 0, 0),
+                        "pen": pg.mkPen(0, 0, 0, 0),
+                        "size": 1,
+                    }
+                )
+            self.detection_timeline_events = retained
+            self.detection_timeline_scatter.setData(spots=points)
+
+        def clear_detection_timeline(self) -> None:
+            for marker in self.detection_timeline_events:
+                self.plot.removeItem(marker["text_item"])
+            self.detection_timeline_events.clear()
+            self.detection_timeline_scatter.setData(spots=[])
+            self.radar_sample_times.clear()
+            self.last_timeline_ml_label = None
+            self.plot_follow_checkbox.setChecked(True)
+            self.scroll_plot_to_live()
+
         def handle_live_detection(self, event: DetectionEvent) -> None:
+            self.record_detection_timeline_event(event)
+            self.update_fusion_diagnostic(event)
+            self.play_detection_sound(event)
             record = {
                 "schema_version": "1.0",
                 **event.to_record(),
@@ -1523,7 +2109,7 @@ def run_monitor(
                 "device_id": "rx-s3-001",
                 "channel": self.current_channel,
             }
-            event_path = self.event_journal.append(record)
+            self.event_journal.append(record)
             if event.event_type in FALL_HISTORY_EVENT_TYPES:
                 self.refresh_fall_history()
             labels = {
@@ -1533,8 +2119,7 @@ def run_monitor(
             }
             label = labels.get(event.label, event.label)
             self.action_status.setText(
-                f"자동 행동 감지: {label} | 신뢰 지표 {event.confidence * 100:.0f}% | "
-                f"기록 {event_path.name}"
+                f"자동 행동 감지: {label} · 신뢰 지표 {event.confidence * 100:.0f}%"
             )
             if event.event_type != "fall_suspected":
                 self.action_status.setStyleSheet(
@@ -1569,6 +2154,37 @@ def run_monitor(
                 return
             self.start_fall_alert_delivery(endpoint, app_event, "자동 낙상 의심 감지")
 
+        def set_radar_fallback_enabled(self, enabled: bool) -> None:
+            if self.activity_aggregator is None:
+                return
+            self.activity_aggregator.set_radar_fallback_threshold(
+                0.90 if enabled else None
+            )
+            if enabled:
+                self.fusion_diagnostic_status.setText(
+                    "융합 진단: 실험적 Radar 단독 보조 알림 사용 · "
+                    "90% 이상·충격비 5 이상이면 ML을 15초 기다린 뒤 경보"
+                )
+                color = "#b54708"
+            else:
+                self.fusion_diagnostic_status.setText(
+                    "융합 진단: ML과 Radar 낙상 후보 대기 · Radar 단독 보조 알림 꺼짐"
+                )
+                color = "#495057"
+            self.fusion_diagnostic_status.setStyleSheet(
+                f"background:{color};color:white;padding:8px;border-radius:5px;"
+            )
+
+        def play_detection_sound(self, event: DetectionEvent) -> None:
+            if not self.fall_sound_checkbox.isChecked():
+                return
+            beep_count = self.detection_sound_policy.beep_count(
+                event.event_type,
+                now=monotonic(),
+            )
+            for index in range(beep_count):
+                QTimer.singleShot(220 * index, QApplication.beep)
+
         def send_manual_fall_alert_test(self) -> None:
             endpoint = self.fall_alert_endpoint.text().strip()
             if not endpoint:
@@ -1586,6 +2202,68 @@ def run_monitor(
                 room_id=str(self.active_profile["roomId"]),
             )
             self.start_fall_alert_delivery(endpoint, event, "앱 알림 테스트")
+
+        def run_safe_fall_detection_simulation(self) -> None:
+            endpoint = self.fall_alert_endpoint.text().strip()
+            self.collection_status.setText(
+                "알림 경로 시뮬레이션 실행 중 · 합성 Radar→ML 후보 생성"
+            )
+            now = monotonic()
+            detected_at = utc_now()
+            simulation_id = f"safe-simulation-{uuid4().hex}"
+            simulation = ActivityEventAggregator(
+                fall_score_threshold=0.80,
+                episode_gap_seconds=1.0,
+                radar_correlation_seconds=self.fusion_correlation_seconds,
+            )
+            radar_event = DetectionEvent(
+                event_id=simulation_id,
+                event_type="fall_suspected",
+                label="fall_like",
+                detected_at=detected_at,
+                confidence=0.92,
+                source="impact_then_no_recovery_rule",
+                evidence={
+                    "impact_ratio": 4.0,
+                    "post_impact_moving_ratio": 0.0,
+                    "no_recovery_sec": 8.0,
+                    "presence_state": "present",
+                    "presence_probability": 1.0,
+                    "sample_count": 32,
+                    "simulation": True,
+                },
+            )
+            simulation.fuse_radar_fall(radar_event, observed_at=now)
+            self.handle_live_detection(simulation.radar_candidate(radar_event))
+            simulation.observe(
+                ActivityPrediction(
+                    label="fall_suspected",
+                    scores={
+                        "fall_suspected": 0.95,
+                        "walking": 0.02,
+                        "other_motion": 0.03,
+                    },
+                    confidence=0.95,
+                    first_sequence=1,
+                    last_sequence=950,
+                    window_finished_at=detected_at,
+                    model_version="safe-detection-simulation",
+                    preprocessing_version="amplitude-zscore-v1",
+                ),
+                observed_at=now + 1.0,
+                detected_at=detected_at,
+            )
+            for event in simulation.expire(now + 2.1):
+                self.handle_live_detection(event)
+            if endpoint:
+                self.collection_status.setText(
+                    "알림 경로 시뮬레이션 완료 · 앱 테스트 알림 전송 중"
+                )
+            else:
+                self.collection_status.setText(
+                    "알림 경로 시뮬레이션 완료 · 경고음·JSONL 확인 완료 · "
+                    "서버 주소가 없어 앱 알림은 생략"
+                )
 
         def start_fall_alert_delivery(
             self,
@@ -1627,13 +2305,120 @@ def run_monitor(
                     "message": message,
                 }
             )
+            delivery_labels = {
+                "sending": ("앱 알림 전송 중", "#175cd3"),
+                "delivered": ("앱 알림 전달 완료", "#087f3d"),
+                "failed": ("앱 알림 전송 실패", "#b42318"),
+                "skipped": ("앱 서버 주소가 없어 알림 미전송", "#b54708"),
+            }
+            label, color = delivery_labels.get(status, (status, "#495057"))
+            detail = f" · {message}" if message else ""
+            self.fusion_diagnostic_status.setText(f"융합 진단: {label}{detail}")
+            self.fusion_diagnostic_status.setStyleSheet(
+                f"background:{color};color:white;padding:8px;border-radius:5px;"
+            )
             self.refresh_fall_history()
+
+        def update_fusion_diagnostic(self, event: DetectionEvent) -> None:
+            now = monotonic()
+            if event.event_type == "ml_fall_candidate":
+                self.fusion_candidate_kind = "ML"
+                self.fusion_candidate_at = now
+                self.fusion_diagnostic_status.setText(
+                    "융합 진단: ML 낙상 후보 감지 · 15초 안의 Radar 충격 후보 대기"
+                )
+                color = "#175cd3"
+            elif event.event_type == "radar_fall_candidate":
+                self.fusion_candidate_kind = "Radar"
+                self.fusion_candidate_at = now
+                self.fusion_diagnostic_status.setText(
+                    "융합 진단: Radar 낙상 후보 감지 · 15초 안의 ML 후보 대기"
+                )
+                color = "#b54708"
+            elif event.event_type == "fall_suspected":
+                self.fusion_candidate_kind = None
+                self.fusion_candidate_at = None
+                simulation = bool(event.evidence.get("simulation"))
+                fallback = event.source == "radar_high_confidence_fallback"
+                if fallback:
+                    self.fusion_diagnostic_status.setText(
+                        "융합 진단: 고신뢰 Radar 단독 보조 경보 · "
+                        "ML 미확인 상태로 앱 알림 전송 판단"
+                    )
+                    color = "#c4320a"
+                else:
+                    prefix = "안전 시뮬레이션 · " if simulation else ""
+                    self.fusion_diagnostic_status.setText(
+                        f"융합 진단: {prefix}ML+Radar 결합 완료 · 앱 알림 전송 판단"
+                    )
+                    color = "#b42318"
+            else:
+                return
+            self.fusion_diagnostic_status.setStyleSheet(
+                f"background:{color};color:white;padding:8px;border-radius:5px;"
+            )
+
+        def update_radar_pending_diagnostic(self, now: float) -> None:
+            pending = self.live_detector.pending_fall_status(now)
+            if pending is not None:
+                self.radar_pending_visible = True
+                self.fusion_diagnostic_status.setText(
+                    "Radar 충격 관측 · "
+                    f"충격비 {pending['impact_ratio']:.2f} · "
+                    "무회복 확인 중 "
+                    f"{pending['remaining_seconds']:.1f}초 남음 · "
+                    "회복 움직임이 있으면 후보가 취소됩니다"
+                )
+                self.fusion_diagnostic_status.setStyleSheet(
+                    "background:#b54708;color:white;padding:8px;border-radius:5px;"
+                )
+                return
+            if self.radar_pending_visible and self.fusion_candidate_kind is None:
+                self.fusion_diagnostic_status.setText(
+                    "Radar 충격 관찰 종료 · 회복 움직임 또는 판정 조건 미충족으로 "
+                    "낙상 후보를 만들지 않음"
+                )
+                self.fusion_diagnostic_status.setStyleSheet(
+                    "background:#495057;color:white;padding:8px;border-radius:5px;"
+                )
+            self.radar_pending_visible = False
+
+        def update_fusion_timeout(self, now: float) -> None:
+            if self.fusion_candidate_kind is None or self.fusion_candidate_at is None:
+                return
+            if now - self.fusion_candidate_at <= self.fusion_correlation_seconds:
+                return
+            missing = "Radar 충격" if self.fusion_candidate_kind == "ML" else "ML"
+            self.fusion_diagnostic_status.setText(
+                f"융합 미완료: {self.fusion_candidate_kind} 후보만 감지 · "
+                f"15초 안에 {missing} 후보가 없어 알림하지 않음"
+            )
+            self.fusion_diagnostic_status.setStyleSheet(
+                "background:#b54708;color:white;padding:8px;border-radius:5px;"
+            )
+            self.fusion_candidate_kind = None
+            self.fusion_candidate_at = None
 
         def refresh_fall_history(self) -> None:
             records = self.event_journal.recent_fall_records(limit=20)
             self.fall_history.setPlainText(
-                "\n".join(format_fall_history_record(record) for record in records)
+                "\n\n".join(format_fall_history_record(record) for record in records)
             )
+            event_files = sorted(
+                self.event_journal.event_dir.glob("*.jsonl"),
+                reverse=True,
+            )
+            if event_files:
+                latest_path = event_files[0].relative_to(self.project_root)
+                self.event_log_status.setText(
+                    f"최근 {len(records)}건 표시 · 이벤트 기록: {latest_path}\n"
+                    "자동 감지·알림 결과만 저장하며 원시 CSI 수집 파일과는 별개입니다."
+                )
+            else:
+                self.event_log_status.setText(
+                    "이벤트 기록 대기 · 감지 결과는 data/events/YYYY-MM-DD.jsonl에 "
+                    "날짜별 저장됩니다. 원시 CSI 수집 파일과는 별개입니다."
+                )
 
         def release_fall_alert_worker(self, worker: FallAlertWorker) -> None:
             if worker in self.fall_alert_workers:
@@ -1847,6 +2632,7 @@ def run_monitor(
             self.set_collection_controls_enabled(False)
             self.jitter_values.clear()
             self.threshold_values.clear()
+            self.clear_detection_timeline()
             self.jitter_curve.clear()
             self.threshold_curve.clear()
 
@@ -1981,6 +2767,16 @@ def run_monitor(
             self.current_moving = sample.moving
             self.jitter_values.append(sample.jitter)
             self.threshold_values.append(sample.move_threshold)
+            sample_epoch = datetime.now(timezone.utc).timestamp()
+            self.radar_sample_times.append(sample_epoch)
+            while (
+                self.radar_sample_times
+                and sample_epoch - self.radar_sample_times[0]
+                > self.plot_history_seconds
+            ):
+                self.radar_sample_times.popleft()
+                self.jitter_values.popleft()
+                self.threshold_values.popleft()
             if self.scanning_channels and self.scan_phase == "measuring":
                 self.scan_radar_times.append(self.last_sample_at)
             if self.collection_phase == "recording":
@@ -1994,9 +2790,17 @@ def run_monitor(
             else:
                 self.show_link(self.last_link_sample)
 
-            x_values = list(range(len(self.jitter_values)))
+            latest_sample_at = self.radar_sample_times[-1]
+            x_values = list(self.radar_sample_times)
             self.jitter_curve.setData(x_values, list(self.jitter_values))
             self.threshold_curve.setData(x_values, list(self.threshold_values))
+            if self.plot_follow_live:
+                self.plot.setXRange(
+                    latest_sample_at - self.plot_live_window_seconds,
+                    latest_sample_at,
+                    padding=0,
+                )
+            self.refresh_detection_timeline()
             self.plot.enableAutoRange(axis="y")
 
             if self.scanning_channels or self.calibrating:
@@ -2048,6 +2852,7 @@ def run_monitor(
                         )
                     else:
                         self.handle_live_detection(detected_event)
+                self.update_radar_pending_diagnostic(now)
 
             if self.scanning_channels or self.collecting:
                 pass
@@ -2101,9 +2906,10 @@ def run_monitor(
             )
 
         def update_health(self) -> None:
+            now = monotonic()
+            self.update_fusion_timeout(now)
             if self.calibrating or self.scanning_channels or self.collecting:
                 return
-            now = monotonic()
             self.show_presence(
                 self.presence_detector.health(
                     calibrated=self.is_presence_calibrated(),
