@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import sys
 import json
+import os
 import platform
 from collections import deque
 from datetime import datetime
 from pathlib import Path
 from queue import Empty, Queue
 from time import monotonic
+from uuid import uuid4
 
 from .cli import build_record, create_session_paths, utc_now, write_json_line
 from .collection import (
@@ -23,6 +25,11 @@ from .features import (
     build_current_calibration_presence_rows,
     build_profile_feature_rows,
     extract_session_features,
+)
+from .fall_alert import (
+    FallAlertError,
+    build_collection_fall_event,
+    send_fall_event,
 )
 from .datasets import (
     DatasetError,
@@ -135,6 +142,23 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             except Exception as exc:
                 self.read_error.emit(str(exc))
 
+    class FallAlertWorker(QThread):
+        delivered = pyqtSignal(str)
+        failed = pyqtSignal(str)
+
+        def __init__(self, endpoint: str, event: dict[str, object]) -> None:
+            super().__init__()
+            self.endpoint = endpoint
+            self.event = event
+
+        def run(self) -> None:
+            try:
+                send_fall_event(self.endpoint, self.event)
+            except (FallAlertError, ValueError) as exc:
+                self.failed.emit(str(exc))
+            else:
+                self.delivered.emit(str(self.event["window_id"]))
+
     class RadarWindow(QMainWindow):
         def __init__(self) -> None:
             super().__init__()
@@ -181,6 +205,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.collection_radar_samples: list[RadarSample] = []
             self.collection_link_samples: list[LinkSample] = []
             self.collection_safety_confirmed: bool | None = None
+            self.fall_alert_workers: list[FallAlertWorker] = []
 
             self.status = QLabel("WAITING FOR RADAR DATA")
             self.status.setAlignment(Qt.AlignCenter)
@@ -303,6 +328,17 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             )
             self.collection_fall_safety_checkbox = QCheckBox("모의 낙상 안전 수집")
 
+            self.fall_alert_endpoint = QLineEdit()
+            self.fall_alert_endpoint.setText(
+                os.environ.get("CARNATION_EVENT_API_URL", "")
+            )
+            self.fall_alert_endpoint.setPlaceholderText(
+                "앱 서버 주소 (예: http://192.168.0.5:8080)"
+            )
+            self.fall_alert_test_button = QPushButton("앱 알림 테스트")
+            self.fall_alert_test_button.setFont(QFont("Arial", 10, QFont.Bold))
+            self.fall_alert_test_button.clicked.connect(self.send_manual_fall_alert_test)
+
             self.collection_start_button = QPushButton("행동 수집 시작")
             self.collection_start_button.setFont(QFont("Arial", 11, QFont.Bold))
             self.collection_start_button.clicked.connect(self.start_collection)
@@ -318,6 +354,11 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             collection_controls.addWidget(self.collection_start_button)
             collection_layout = QVBoxLayout()
             collection_layout.addLayout(collection_controls)
+            fall_alert_layout = QHBoxLayout()
+            fall_alert_layout.addWidget(QLabel("낙상 알림 서버"))
+            fall_alert_layout.addWidget(self.fall_alert_endpoint, 1)
+            fall_alert_layout.addWidget(self.fall_alert_test_button)
+            collection_layout.addLayout(fall_alert_layout)
             collection_layout.addWidget(self.collection_status)
             collection_group = QGroupBox("행동 데이터 수집")
             collection_group.setLayout(collection_layout)
@@ -834,6 +875,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 enabled and self.collection_cue_checkbox.isChecked()
             )
             self.collection_start_button.setEnabled(enabled)
+            self.fall_alert_endpoint.setEnabled(enabled)
+            self.fall_alert_test_button.setEnabled(enabled)
             self.channel_scan_button.setEnabled(enabled)
             self.calibrate_button.setEnabled(enabled)
             self.profile_combo.setEnabled(enabled)
@@ -1208,6 +1251,86 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                     f"원본과 한글 요약을 저장했습니다.\n\n"
                     f"{prediction_message}\n\n{summary_path}",
                 )
+            if valid and self.collection_label in FALL_LABELS:
+                self.dispatch_collection_fall_alert()
+
+        def dispatch_collection_fall_alert(self) -> None:
+            endpoint = self.fall_alert_endpoint.text().strip()
+            if not endpoint:
+                self.collection_status.setText(
+                    "모의 낙상 수집 완료 | 앱 서버 주소가 없어 알림 미전송"
+                )
+                QMessageBox.warning(
+                    self,
+                    "낙상 의심 알림 미전송",
+                    "유효한 모의 낙상 수집을 확인했지만 앱 서버 주소가 비어 있습니다.\n"
+                    "'낙상 알림 서버'에 문서에서 받은 주소를 입력한 뒤 다시 수집하세요.",
+                )
+                return
+
+            detected_at = (
+                self.collection_event_at
+                or str(self.collection_manifest["finishedAtUtc"])
+            )
+            event = build_collection_fall_event(
+                session_id=self.collection_session_id,
+                detected_at=detected_at,
+                room_id=str(self.active_profile["roomId"]),
+            )
+            self.start_fall_alert_delivery(endpoint, event, "모의 낙상 수집 완료")
+
+        def send_manual_fall_alert_test(self) -> None:
+            endpoint = self.fall_alert_endpoint.text().strip()
+            if not endpoint:
+                QMessageBox.warning(
+                    self,
+                    "앱 서버 주소 필요",
+                    "'낙상 알림 서버'에 http://<서버-IP>:8080 형식으로 입력하세요.",
+                )
+                return
+
+            window_id = f"manual-test-{uuid4().hex}"
+            event = build_collection_fall_event(
+                session_id=window_id,
+                detected_at=utc_now(),
+                room_id=str(self.active_profile["roomId"]),
+            )
+            self.start_fall_alert_delivery(endpoint, event, "앱 알림 테스트")
+
+        def start_fall_alert_delivery(
+            self,
+            endpoint: str,
+            event: dict[str, object],
+            status_prefix: str,
+        ) -> None:
+            worker = FallAlertWorker(endpoint, event)
+            self.fall_alert_workers.append(worker)
+            worker.delivered.connect(self.fall_alert_delivered)
+            worker.failed.connect(self.fall_alert_failed)
+            worker.finished.connect(lambda: self.release_fall_alert_worker(worker))
+            self.collection_status.setText(
+                f"{status_prefix} | 앱 알림 전송 중: {event['window_id']}"
+            )
+            worker.start()
+
+        def release_fall_alert_worker(self, worker: FallAlertWorker) -> None:
+            if worker in self.fall_alert_workers:
+                self.fall_alert_workers.remove(worker)
+            worker.deleteLater()
+
+        def fall_alert_delivered(self, window_id: str) -> None:
+            self.collection_status.setText(
+                f"낙상 의심 알림 전송 완료 | window_id: {window_id}"
+            )
+            QMessageBox.information(
+                self,
+                "낙상 의심 알림 전송 완료",
+                f"앱 서버가 이벤트를 접수했습니다.\nwindow_id: {window_id}",
+            )
+
+        def fall_alert_failed(self, message: str) -> None:
+            self.collection_status.setText("낙상 의심 알림 전송 실패")
+            QMessageBox.warning(self, "낙상 의심 알림 전송 실패", message)
 
         def start_channel_scan(self) -> None:
             reply = QMessageBox.question(
