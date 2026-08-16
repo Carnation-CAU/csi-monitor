@@ -1,257 +1,371 @@
-# 움직임 분류 전략과 버전 로드맵
+# 서버 기반 CSI 움직임 분류 개발 전략
 
-최종 수정일: 2026-08-12
+최종 수정일: 2026-08-16
 
-## 1. 담당 범위
+## 1. 목표와 확정된 역할
 
-이 모듈의 목표는 **움직임이 감지된 구간의 행동을 분류하는 것**이다.
+gateway가 재실과 움직임을 확인하면 ML 서버가 최근 수 초의 ESP32-S3 raw CSI로
+`walking / fall_suspected / other_motion / unknown`을 분류한다.
 
 ```text
-친구 담당: 빈 방 보정 → 사람 재실 여부 → 움직임 여부(moving)
-내 담당:   움직임 이벤트 구간 → walking / fall_suspected / other_motion
-향후 통합: moving 이벤트 → ML 입력 → 분류 결과
+gateway
+  채널·공간 보정 → 재실 판단 → moving 판단 → raw CSI와 시각 전달
+                                                ↓
+ML 서버
+  ring buffer → 최근 N초 window → 반복 추론 → 시간축 안정화 → 행동 결과
 ```
 
-재실 판단의 `wander`, 움직임 판단의 `jitter`와 동적 threshold 계산은 기존
-gateway의 책임이다. ML은 이를 다시 구현하지 않는다. 현재는 독립적으로 모델을
-개발하고, 성능이 확보된 뒤 입력·출력 연결부만 합친다.
+gateway는 채널, 빈방 보정, `wander`·`jitter`, 재실과 `moving`을 담당한다. ML은
+이를 재구현하지 않는다. ML의 주 입력은 `moving` 시각에 대응하는 raw CSI며 Radar
+파생값은 품질 확인이나 보조 특징으로만 비교한다.
 
-## 2. 변경 금지 원칙
+온디바이스 실행은 목표가 아니다. 서버에서 정확도, 낙상 recall, 거짓 경보율과
+일반화 성능이 가장 좋은 모델을 선택한다. 모델 크기는 선제적으로 제한하지 않되
+실시간 지연, 처리량과 장치당 서버 비용을 함께 기록한다.
 
-1. 행동 분류와 관련한 코드·문서·결과는 `ml/` 안에서만 작업한다.
-2. `gateway/`, `firmware/`, `scripts/` 등 기존 코드는 수정하지 않는다.
-3. 통합이 필요해지는 시점에는 먼저 인터페이스를 문서로 합의한 뒤 별도 작업한다.
+## 2. 변경 범위와 책임
 
-## 3. 초기 분류 레이블
+1. 행동 분류 코드·문서·실험 결과는 `ml/` 안에서 작업한다.
+2. `gateway/`, `firmware/`, `scripts/`는 ML 실험에서 직접 수정하지 않는다.
+3. gateway 변경이 필요하면 데이터 계약 변경안을 먼저 문서화한다.
+4. `data/`의 원본, manifest와 공간 프로필은 읽기 전용으로 사용한다.
+5. 학습과 실시간 추론은 같은 파서, subcarrier 선택, 정규화와 window 생성기를 쓴다.
 
-| 출력 | 의미 |
+## 3. 실시간 추론 구조
+
+### 3.1 입력 버퍼
+
+서버는 장치별 raw CSI ring buffer를 유지한다. `moving=true`가 되면 새 프레임이
+들어올 때마다 또는 고정 stride마다 최근 N초 window를 모델에 넣는다.
+
+| 항목 | 초기 후보 |
 |---|---|
-| `walking` | 걷기 |
-| `fall_suspected` | 낙상 확정이 아닌 확인이 필요한 낙상 의심 이벤트 |
-| `other_motion` | 걷기나 낙상이 아닌 움직임과 거부 클래스 |
+| window 길이 | 1초, 2초, 3초, 4초 |
+| stride | 50ms, 100ms, 250ms |
+| 추론 빈도 | 초당 4·10·20회 |
+| 입력 | `T × 52` amplitude, 선택적으로 phase·Radar 보조 특징 |
+| 종료 후 유지 | moving 종료 뒤 1~3초 |
 
-`run`, `jump`, `squat`, `turn`, `arm_wave`는 서비스의 최종 출력으로 사용하지
-않는다. 다만 낙상과 혼동되는 사례를 학습시키기 위한 `other_motion`의 보조
-레이블 또는 hard negative로는 활용한다.
+낙상 후 정지를 관찰하도록 moving이 끝나도 짧은 시간 추론을 유지한다. 온라인
+성능은 해당 시점까지 도착한 과거와 현재 데이터만으로 측정한다.
 
-모델이 모든 입력을 걷기나 낙상으로 강제 분류하지 않도록, 이후 자체 데이터가
-충분해지면 낮은 신뢰도의 결과를 `unknown`으로 거부하는 기능도 추가한다.
+### 3.2 예측 안정화
 
-## 4. 데이터와 입력 전략
+window별 확률을 그대로 경보로 보내지 않고 validation에서 다음을 비교한다.
 
-### 공개 데이터
+- 최근 K개 확률의 지수 이동평균
+- 연속 K회 같은 클래스일 때 확정
+- 낙상 확률 최고값과 지속시간 결합
+- 전용 fall detector와 multiclass classifier 앙상블
+- 낮은 최대 확률 또는 높은 entropy를 `unknown`으로 거부
 
-현재 ESP-Fi HAR의 4개 환경, 8명, 7개 행동, 총 2,240개 샘플을 사용한다.
-입력은 `time × 52 subcarrier amplitude`이며 공개 데이터로 다음을 검증한다.
+경보 threshold와 K는 validation에서만 정한다.
 
-- 학습·평가 코드가 정상 작동하는지
-- 어떤 전처리와 특징이 행동 분류에 유효한지
-- 참가자와 환경이 달라질 때 성능이 얼마나 떨어지는지
+### 3.3 출력 계약
 
-공개 데이터는 ESP32-C3와 통제된 공간에서 수집됐으므로, 그 성능을 우리
-ESP32-S3 및 실제 주거 환경 성능으로 해석하지 않는다.
-
-### 자체 데이터
-
-gateway는 시리얼 원문을 JSONL로 보존한다. 각 `RADAR_DADA`에는 시간 순서와
-`wander`, `jitter`, threshold, `someone`, `moving`이 포함된다. ML에서는
-`moving=true`가 이어지는 구간과 앞뒤 문맥을 하나의 행동 이벤트로 만든다.
-
-현재 gateway의 processed feature CSV는 세션 전체를 평균·표준편차·최댓값으로
-요약한다. 기준선에는 쓸 수 있지만 걷기 반복이나 낙상 전후처럼 **시간에 따른
-모양**이 사라지므로 최종 행동 분류의 주 입력으로 사용하지 않는다.
-
-공개 CSI amplitude와 Radar의 `jitter`는 같은 값이 아니다. 두 데이터는 각각
-전처리하되 아래와 같은 공통 개념의 특징으로 비교한다.
-
-- 기준 상태 대비 변화량
-- 시간 차분과 변화 속도
-- peak의 크기·개수·간격
-- 이벤트 지속시간과 반복성
-- 이벤트 전반부와 후반부 차이
-- 큰 움직임 이후 무활동 시간
-
-## 5. 향후 모델 인터페이스
-
-통합 전까지 아래 계약을 기준으로 독립 개발한다.
-
-```text
-입력
-  - 한 개의 움직임 이벤트 시계열
-  - 이벤트 앞뒤의 짧은 문맥
-  - 사용 가능한 경우 빈 방/공간 기준값
-
-출력
-  - label: walking | fall_suspected | other_motion | unknown
-  - 각 클래스 점수 또는 confidence
-  - model_version
+```json
+{
+  "deviceId": "rx-s3-001",
+  "windowFinishedAtUtc": "...",
+  "label": "fall_suspected",
+  "scores": {"walking": 0.03, "fall_suspected": 0.91, "other_motion": 0.06},
+  "confidence": 0.91,
+  "modelVersion": "model-v001",
+  "preprocessingVersion": "csi-window-v1"
+}
 ```
 
-실제 JSON 스키마와 호출 방식은 모델이 확정된 뒤 gateway 담당자와 합의한다.
+## 4. 데이터 파이프라인
 
-## 6. 완료된 버전
+### 4.1 raw CSI 표준화
 
-### v0 — 최초 머신러닝 기준선
+```text
+JSONL의 CSI_DATA
+  → timestamp와 I/Q 파싱
+  → 유효 subcarrier 선택
+  → amplitude = sqrt(I² + Q²)
+  → 이상 패킷·긴 공백 표시
+  → 고정 표본률 재표본화 또는 마스크 생성
+  → train 통계로 정규화
+```
 
-- ESP-Fi HAR 회의실 데이터 560개 사용
-- amplitude에서 45개 수동 특징 생성
-- 참가자 한 명씩 제외하는 평가 수행
-- 로지스틱 회귀와 Random Forest 비교
-- 걷기는 구분 가능성이 보였지만 낙상 F1은 약 38%로 실사용 불가
+공개 ESP-Fi HAR와 자체 ESP32-S3가 모두 `time × subcarrier amplitude`가 되면 공개
+데이터 사전학습과 자체 fine-tuning을 비교할 수 있다. 장치, 펌웨어, 방과 배치가
+다르므로 공개 데이터 성능을 자체 환경 성능으로 해석하지 않는다.
 
-상세 결과: `v0/RESULTS.md`
+정규화 후보:
 
-### v0.1 — 환경 조사와 오류 분석
+- window별 z-score
+- 세션 빈방 baseline 대비 변화량
+- subcarrier별 train 평균·표준편차
+- robust scaling(median/IQR)
+- amplitude와 1차 차분의 다채널 입력
 
-- 장치·환경·표본 형태와 우리 시스템의 차이 조사
-- 7개 원본 행동을 학습한 뒤 3개 출력으로 합치는 전략 비교
-- peak 정렬과 전후 에너지 특징 비교
-- 낙상 F1은 최고 약 40%로 소폭 개선
-- 점프, 스쿼트, 방향 전환 등이 주요 낙상 오탐임을 확인
+### 4.2 v3의 역할
 
-상세 결과: `v0_1/RESULTS.md`
+v3는 모델이 아니라 오프라인 데이터 검증·생성 파이프라인이다.
 
-### v1 — 4개 환경 머신러닝 비교
+- 실제 `moving` 구간과 행동 시각의 일치 확인
+- 짧은 moving 단절 병합과 별도 행동 분리
+- manifest 라벨 연결
+- 동일 이벤트에서 CNN용 sliding window 생성
+- raw CSI와 Radar timestamp 정렬 검증
+- 세션·참가자·공간 단위 split 메타데이터 생성
 
-- ESP-Fi HAR 전체 2,240개 사용
-- 행동 번호와 중복 패킷 문제 검증 및 보정
-- 7개 행동 학습 후 3개로 병합, 계층 분류, 무활동 결합 비교
-- 처음 보는 사람의 걷기 F1: 78.74%
-- 처음 보는 사람의 낙상 F1: 38.77%
-- 처음 보는 장소의 낙상 F1: 34.23%
-- 복잡한 판단 규칙이나 무활동 조건만으로는 낙상이 개선되지 않음
+현재 이벤트 전체 64시점 Radar 입력은 기존 산출물로 유지한다. 서버 모델의 주
+입력은 이벤트 전체를 압축한 배열이 아니라 실시간과 동일한 고정 시간 window다.
 
-상세 결과: `v1/RESULTS.md`
+### 4.3 window 라벨
 
-### v1.1 — 점프·스쿼트 제외 실험
+한 세션의 모든 window에 세션 라벨을 무조건 붙이지 않는다.
 
-- 독거노인 생활환경에서 드문 `jump`, `squat`을 학습과 주 평가에서 제외
-- 기존 7개 행동 모델과 동일한 5개 test 행동에서 공정하게 비교
-- 처음 보는 사람의 낙상 F1: 46.57% → 53.04%
-- 처음 보는 장소의 낙상 F1: 41.21% → 50.48%
-- 걷기 F1은 유지 또는 소폭 개선
-- 제외한 점프·스쿼트를 별도로 입력하면 약 32%를 낙상으로 오인
+- 실제 행동과 겹치는 window: manifest 행동 라벨
+- 행동 전 준비 구간: 학습 제외 또는 context
+- 행동 후 구간: 낙상 후 정지 분석용으로 별도 표시
+- 경계가 불확실한 window: `unknown` 또는 학습 제외
 
-공개 데이터에서는 5개 행동 구성을 다음 기준선으로 채택한다. 자체 데이터에서는
-제외한 행동의 자리를 빠르게 앉기, 눕기, 물건 줍기 등 실제 생활 유사 동작으로
-교체해야 한다.
+`eventAtUtc`는 GUI 신호 시각이지 실제 동작 시작 정답이 아니다. v3 경계, 관찰
+기록과 가능하면 동기화된 영상으로 실제 구간을 확인한다.
 
-상세 결과: `v1_1/RESULTS.md`
+## 5. 데이터 구성 전략
 
-### v2 — DTW 시계열 분류 실험
+### 5.1 공개 데이터
 
-- v2-A: 64개 시간점의 motion-energy 대표 파형을 DTW로 직접 비교
-- v2-B: 기존 45개 통계 특징에 행동별 DTW 거리 추가
-- 전체 행동 모델과 점프·스쿼트 제외 모델을 모두 평가
-- DTW 단독은 걷기와 낙상 성능이 크게 하락
-- 통계+DTW는 일부 조건에서 낙상 F1이 소폭 올랐지만 사람·환경 평가에서
-  일관되지 않았고 걷기와 제외 행동 안전성이 악화
-- 시간 속도 보정보다 행동 파형 중첩, 환경 차이와 부정확한 이벤트 경계가 더 큰
-  병목으로 판단
+ESP-Fi HAR 4개 환경, 8명, 7행동, 2,240개를 다음에 사용한다.
 
-DTW 모델은 채택하지 않고 v1.1의 통계 특징 모델을 공개 데이터 기준선으로
-유지한다.
+- 공개 데이터 기준선 재현
+- raw amplitude 모델 사전학습
+- 모델 구조와 augmentation 후보 선별
+- leave-one-participant/environment-out 평가
 
-상세 결과: `v2/RESULTS.md`
+공개 `fall`과 자체 `fall_simulated_mattress`는 동일 행동이라고 단정하지 않는다.
 
-### v3 — ESP32-S3 추론 입력 전처리
+### 5.2 자체 데이터
 
-- gateway JSONL의 `RADAR_DADA`와 링크 로그를 독립적으로 파싱
-- `moving=true` 구간을 병합·분리하고 앞뒤 문맥을 포함한 이벤트 생성
-- 가변 길이 이벤트를 64개 시간점의 고정 입력으로 변환
-- threshold 상대값, 통계, 변화 속도, 반복성과 사후 무활동 특징 생성
-- 저장된 학습 데이터와 향후 추론 버퍼에서 같은 변환 함수를 사용하도록 구성
-- 합성 gateway 데이터 자동 테스트 7개 통과
-- 현재 로컬 실제 JSONL·manifest가 없어 실제 이벤트 경계 검증은 대기
+- `walking`: 느린·보통 걷기, 방향·속도 변화
+- `fall_suspected`: 안전한 매트리스 위 통제된 모의 낙상
+- `other_motion`: 빠르게 앉기, 눕기, 일어나기, 물건 줍기, 몸 돌리기,
+  비틀거리기, 균형 회복, 큰 팔 동작
 
-상세 결과: `v3/RESULTS.md`
+실제 바닥 낙상은 수집하지 않는다. 사람, 방, 위치, 방향, 날짜와 의복을 다르게
+반복하며 클래스 표본 수보다 참가자·공간 다양성을 우선한다.
 
-## 7. 현재 판단
+### 5.3 데이터 분할
 
-- 공개 데이터에서 걷기는 어느 정도 학습 가능하다.
-- 낙상은 다른 큰 동작과 신호가 겹쳐 현재 특징만으로 안정적으로 구분되지 않는다.
-- 생활환경과 맞지 않는 점프·스쿼트를 제외하면 낙상 분류가 개선되지만, 예상 밖의
-  큰 동작에 대한 안전성은 낮아진다.
-- 방과 사람 변화에 따른 성능 저하가 크다.
-- 병목은 단순히 모델 종류가 아니라 환경 차이, 이벤트 전처리와 자체 데이터 부족이다.
-- 따라서 공개 데이터 점수만 높이기 위한 과도한 튜닝보다 자체 형식과 맞는
-  이벤트 파이프라인을 먼저 검증해야 한다.
+1. 같은 세션과 이벤트에서 나온 window는 반드시 같은 split에 둔다.
+2. 참가자 분리, 공간 분리와 시간 분리 평가를 각각 수행한다.
+3. test 참가자·공간의 정규화 통계를 학습에 사용하지 않는다.
+4. 모델·window·augmentation·threshold 선택은 validation에서만 한다.
+5. 공개 데이터와 자체 데이터 결과를 별도로 기록한다.
 
-## 8. 다음 버전 로드맵
+## 6. 모델 후보군
 
-버전 번호는 실제 구현 폴더와 일치시킨다. 한 버전에서는 핵심 가설 하나만
-검증하고, 이전 버전과 같은 평가 방식으로 비교한다.
+모든 모델은 같은 split, window와 평가 코드에서 비교한다.
 
-| 우선순위 | 버전 | 핵심 작업 | 성공 기준 |
-|---:|---|---|---|
-| 완료 | v2 | 공개 amplitude의 DTW 및 통계+DTW 비교 | 일관된 개선 없음, DTW 미채택 |
-| 진행 | v3 | 자체 JSONL 로더와 `moving` 이벤트 분할 구현 | 구현·합성 검증 완료, 실제 세션 경계 검증 대기 |
-| 1 | v4 | 자체 이벤트에 Random Forest/Gradient Boosting 기준선 적용 | 자체 참가자·공간 분리 결과 확보 |
-| 2 | v5 | 빈 방 기준 정규화와 공간별 baseline 변화량 특징 비교 | 미사용 공간 성능이 기준선보다 일관되게 개선 |
-| 3 | v6 | 1D CNN 등 시계열 딥러닝 비교 | 단순 모델보다 반복 평가에서 유의미한 개선 |
-| 4 | v7 | 정상 행동 이상 탐지와 낙상 위험 규칙 결합 | 낙상 발견률을 유지하며 거짓 경보 감소 |
+### 6.1 필수 기준선
 
-딥러닝은 자체 데이터와 참가자·공간 수가 충분할 때만 진행한다. 작은 데이터에서
-딥러닝 점수가 높더라도 데이터 누수나 환경 암기 가능성을 먼저 확인한다.
+- Logistic Regression
+- Random Forest 또는 Gradient Boosting
+- v1.1의 45개 통계 특징 모델
 
-## 9. 공통 평가 원칙
+딥러닝 모델은 반드시 이 기준선을 반복 평가에서 넘어야 한다.
 
-1. 같은 세션에서 나온 window를 학습과 시험에 나누지 않는다.
-2. 참가자, 공간, 수집 세션 단위로 train/validation/test를 분리한다.
-3. test 데이터로 특징, threshold 또는 모델을 선택하지 않는다.
-4. 공개 데이터 결과와 자체 ESP32-S3 결과를 구분해서 기록한다.
-5. 공개 데이터로 새 실험을 할 때마다 동일한 조건으로 다음 두 모델을 모두
-   학습하고 성능을 나란히 비교한다.
-   - 전체 행동 모델: `jump`, `squat`을 포함해 학습
-   - 생활환경 중심 모델: `jump`, `squat`을 제외하고 학습
-6. 두 모델의 주 성능을 공정하게 비교할 때는 `jump`, `squat`을 제외한 동일한
-   test 표본을 사용한다. 이와 별도로 생활환경 중심 모델에 제외 행동을 입력해
-   낙상 오탐률을 안전성 지표로 기록한다.
-7. 새로운 통계 특징 기반 분류 모델을 시험할 때는 같은 모델에서 다음 두 입력을
-   반드시 함께 비교한다.
-   - 기존 통계 특징만 사용
-   - 기존 통계 특징 + 행동별 DTW 거리 사용
-   DTW의 효과를 모델 자체의 효과와 분리하기 위해 데이터 split, 전처리,
-   hyperparameter 탐색 범위와 random seed를 동일하게 유지한다.
-8. 따라서 새 분류 모델 하나의 기본 실험은 다음 4개 조합으로 구성한다.
-   - 전체 행동 학습 + DTW 없음
-   - 전체 행동 학습 + DTW 추가
-   - 점프·스쿼트 제외 학습 + DTW 없음
-   - 점프·스쿼트 제외 학습 + DTW 추가
-9. DTW는 참가자 분리와 환경 분리 양쪽에서 개선이 반복되고, 걷기 성능과 제외
-   행동 낙상 오탐률을 의미 있게 악화시키지 않을 때만 해당 모델에 채택한다.
-10. 자체 데이터에서는 점프·스쿼트 비교에 더해 빠르게 앉기, 눕기, 일어나기,
-   물건 줍기 등 실제 생활 동작을 `other_motion`으로 포함한 결과를 기록한다.
-11. 전체 정확도만 보지 않고 다음 값을 기록한다.
-   - 행동별 precision, recall, F1
-   - Macro-F1과 confusion matrix
-   - 낙상 거짓 경보 횟수
-   - 참가자별·공간별 성능 편차
-   - 추론 시간
-12. 낙상은 안전상 recall이 중요하지만, 실제 사용성을 위해 precision과 시간당
-   거짓 경보도 함께 본다.
-13. 성능이 비슷하면 더 단순하고 설명 가능한 모델을 선택한다.
+### 6.2 raw 시계열 모델
 
-## 10. 각 버전의 기록 항목
+1. **InceptionTime 계열**: 여러 길이의 시간 패턴 동시 포착
+2. **1D ResNet**: 강한 시계열 분류 기준선
+3. **TCN**: dilated convolution으로 긴 문맥과 낮은 지연 결합
+4. **CNN-LSTM/GRU**: 국소 변화와 장기 순서 결합
+5. **Transformer encoder**: 긴 의존성과 subcarrier 관계 학습
+6. **PatchTST 계열 encoder**: 긴 시계열을 patch 단위로 처리
 
-각 버전 폴더의 `RESULTS.md`에는 다음을 남긴다.
+1D CNN은 후보 중 하나일 뿐 최종 구조로 고정하지 않는다. 서버 GPU에서 큰 ResNet,
+Transformer와 앙상블도 평가한다.
 
-- 검증하려는 가설
-- 사용한 데이터셋, 참가자·환경·세션 수
-- 레이블 매핑과 전처리 설정
-- train/validation/test 그룹 목록 또는 생성 규칙
-- 비교 모델과 파라미터, random seed
-- 전체 및 행동별 결과
-- 전체 행동 모델과 점프·스쿼트 제외 모델의 성능 비교
-- 새 분류 모델의 통계 특징 단독과 통계 특징+DTW 결과 비교
-- 제외 행동에 대한 별도 낙상 오탐률
-- 대표 오분류와 실패 원인
-- 이전 버전 대비 개선 여부
-- 다음 버전에서 검증할 한 가지 핵심 가설
+### 6.3 시공간·스펙트로그램 모델
 
-## 11. 바로 할 일
+raw amplitude, 차분, STFT/CWT를 `시간 × subcarrier` 또는 `시간 × 주파수`
+다채널 이미지로 만들어 다음을 비교한다.
 
-v3 구현은 끝났지만 현재 로컬에 실제 JSONL과 manifest가 없다. 다음 작업은 GUI로
-걷기와 생활 유사 동작의 유효 세션을 수집한 뒤 v3 출력에서 이벤트 경계를 확인하는
-것이다. 실제 경계에 맞춰 병합 간격과 앞뒤 문맥을 고정한 후에만 v4 자체 데이터
-모델을 학습한다. 최종 모델 선택은 자체 참가자·공간 분리 평가 결과를 기준으로 한다.
+- 2D ResNet
+- EfficientNet
+- ConvNeXt
+- Vision Transformer/Swin Transformer
+
+스펙트로그램 전처리 비용도 추론 지연에 포함한다.
+
+### 6.4 YOLO 사용 조건
+
+YOLO는 단순 window 3분류의 첫 선택이 아니다. 다음 가설에서만 시험한다.
+
+```text
+긴 CSI spectrogram
+→ 시간축 bounding box로 행동 발생 위치 탐지
+→ box별 walking / fall_suspected / other_motion 분류
+```
+
+정확한 시작·종료 box 라벨이 있어야 한다. YOLO는 다음 기준선과 비교한다.
+
+- gateway moving + window classifier
+- 1D temporal detector
+- spectrogram segmentation/detection 모델
+
+event mAP뿐 아니라 낙상 recall, 시간당 오탐과 검출 지연에서 이겨야 채택한다.
+
+### 6.5 사전학습과 자기지도학습
+
+- ESP-Fi HAR supervised pretraining 후 자체 fine-tuning
+- 자체 무라벨 CSI masked reconstruction
+- contrastive learning(TS2Vec/CPC 계열)
+- 공개·자체 데이터 domain adaptation
+
+사전학습 모델과 scratch 모델은 같은 자체 test set에서 비교한다.
+
+### 6.6 앙상블
+
+단일 최고 모델 이후에만 시험한다.
+
+- raw 1D 모델 + spectrogram 2D 모델 확률 평균
+- 전용 binary fall detector + 3-class classifier
+- 서로 다른 window 길이의 multi-scale ensemble
+- fold별 모델 앙상블
+
+참가자·공간 양쪽에서 개선되고 서버 비용 대비 이득이 있을 때 채택한다.
+
+## 7. 학습 성능 최대화 전략
+
+### 7.1 augmentation
+
+- 시간 이동과 제한적인 crop
+- amplitude scaling과 작은 Gaussian noise
+- 일부 subcarrier masking
+- packet dropout과 시간 gap simulation
+- 제한적인 time stretching: 걷기 분기에만 비교
+- mixup/cutmix: 라벨 경계 보존 여부 별도 검증
+
+낙상의 급격함과 실제 지속시간을 훼손하는 강한 time warping은 사용하지 않는다.
+
+### 7.2 불균형과 hard negative
+
+- class-balanced sampler 또는 class weight
+- focal loss와 weighted cross-entropy 비교
+- 낙상 오인 생활 동작 hard-negative mining
+- 참가자·공간별 최악 성능을 반영한 모델 선택
+- 운영 오탐을 검토·라벨링해 다음 학습 세트에 추가
+
+같은 낙상 세션의 거의 동일한 window를 과도하게 복제하지 않는다.
+
+### 7.3 하이퍼파라미터 탐색
+
+- window 길이와 stride
+- 정규화 방식
+- depth·width·kernel·patch 크기
+- dropout, weight decay, learning rate
+- loss와 class weight
+- confidence와 시간 안정화 threshold
+
+Optuna 등을 사용할 수 있지만 test set은 탐색에 사용하지 않는다. 최종 후보는 여러
+seed로 반복한다.
+
+### 7.4 확률 보정과 OOD
+
+- temperature scaling 또는 isotonic calibration
+- Expected Calibration Error와 Brier score
+- energy, entropy 또는 embedding distance 기반 `unknown`
+- 학습하지 않은 생활 행동을 OOD test로 평가
+
+보정 전 softmax를 사용자 신뢰도로 표시하지 않는다.
+
+## 8. 평가 지표
+
+### 8.1 분류 성능
+
+- 클래스별 precision, recall, F1
+- Macro-F1, balanced accuracy와 confusion matrix
+- `fall_suspected` PR-AUC
+- 참가자별·공간별 평균과 최저 성능
+- `unknown` 거부율과 거부 후 성능
+
+### 8.2 실시간·이벤트 성능
+
+- 실제 행동 시작부터 첫 올바른 예측까지 지연
+- 낙상 event recall
+- 시간당·일일 낙상 거짓 경보 수
+- 연속 예측의 흔들림 횟수
+- moving 탐지율 × 분류 recall로 계산한 end-to-end 낙상 발견률
+
+중복 window가 지표를 부풀릴 수 있으므로 event 단위 결과를 주 지표로 둔다.
+
+### 8.3 서버 운영 성능
+
+- p50/p95/p99 전처리+추론 지연
+- 장치 한 대당 초당 추론 횟수
+- GPU/CPU 메모리와 동시 장치 수
+- 장치당 월간 추론 비용 추정
+- 패킷 지연·순서 변경·손실 시 복구 동작
+
+정확도가 같으면 지연과 비용이 낮은 모델을 선택하되 작은 비용 차이로 낙상 성능을
+희생하지 않는다.
+
+## 9. 버전 로드맵
+
+| 버전 | 핵심 가설 | 완료 기준 |
+|---|---|---|
+| v3 | 실제 moving 이벤트 경계를 신뢰할 수 있는가 | 실제 세션 경계·문맥 검증 |
+| v3.1 | raw CSI와 Radar를 정렬하고 sliding window를 만들 수 있는가 | 오프라인·온라인 window 동일성 |
+| v5 | 자체 데이터 고전 ML 기준선 | 참가자·공간 분리 기준 점수 |
+| v6 | raw 시계열 딥러닝이 고전 ML을 넘는가 | InceptionTime/ResNet/TCN 반복 개선 |
+| v7 | Transformer·사전학습이 일반화를 높이는가 | 새 참가자·공간에서 반복 개선 |
+| v8 | spectrogram 2D 모델 또는 YOLO가 유효한가 | event 지표와 지연 모두 개선 |
+| v9 | 앙상블·OOD·확률 보정 | 오탐 감소와 신뢰 가능한 confidence |
+| v10 | 서버 실시간 통합 | 목표 동시 접속에서 end-to-end 기준 충족 |
+
+한 버전에서는 핵심 가설 하나만 검증하고 이전 최고 모델과 같은 프로토콜로 비교한다.
+
+## 10. 모델 저장과 재현
+
+```text
+ml/artifacts/model-v001/
+├─ model.pt 또는 model.onnx
+├─ preprocessing.json
+├─ labels.json
+├─ calibration.json
+├─ manifest.json
+└─ metrics.json
+```
+
+Git commit, 데이터 manifest와 split, window·stride·표본률·subcarrier, 정규화,
+모델 구조와 파라미터, seed와 라이브러리, threshold, test 결과, 서버 benchmark와
+파일 체크섬을 기록한다. ONNX/TorchScript 변환 전후 출력 일치도 회귀 테스트한다.
+
+## 11. 완료된 연구와 현재 기준선
+
+| 버전 | 결과 | 판단 |
+|---|---|---|
+| v0 | 최초 특징 모델, 낙상 F1 약 38% | 가능성 확인 |
+| v0.1 | jump 등 큰 동작이 주요 낙상 오탐 | hard negative 필요 |
+| v1 | 계층 분류·무활동도 일반화 부족 | 자체 데이터 우선 |
+| v1.1 | 집중 Logistic, 사람 53.04%·환경 50.48% | 공개 기준선 |
+| v2 | DTW가 일관되게 개선하지 못함 | 낙상 분기 미사용 |
+| v3 | Radar 이벤트 전처리 합성 테스트 통과 | 실제 검증 진행 |
+| v4 | RF·Boosting·SVM 모두 v1.1을 일관되게 넘지 못함 | 미채택 |
+
+v1.1은 배포 모델이 아니라 공개 데이터 기준선이다. 최종 선택은 자체 참가자·공간
+분리와 실시간 event 평가를 기준으로 한다.
+
+## 12. 바로 할 일
+
+1. 실제 행동 세션으로 v3 moving 이벤트 경계를 검증한다.
+2. JSONL `CSI_DATA` 형식, 실제 표본률과 유효 52개 subcarrier를 확정한다.
+3. v3.1에 timestamp 정렬, ring-buffer와 sliding-window 생성기를 구현한다.
+4. 오프라인 JSONL window와 실시간 buffer window의 동일성을 테스트한다.
+5. 자체 데이터를 참가자·공간·행동별로 확대한다.
+6. v5 고전 ML 기준선을 만든다.
+7. v6에서 InceptionTime, 1D ResNet과 TCN을 우선 비교한다.
+8. 데이터가 충분해지면 Transformer, 2D 모델, YOLO와 앙상블로 확장한다.
+
+## 13. 버전별 기록 규칙
+
+각 `RESULTS.md`에는 가설과 변경점, 데이터와 split, window·전처리, 모델·seed,
+클래스별 지표와 confusion matrix, event recall·오탐·지연, 참가자·공간 편차,
+서버 지연·처리량·비용, 실패 원인, 채택 여부와 다음 가설을 남긴다.
