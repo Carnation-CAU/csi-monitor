@@ -113,7 +113,8 @@ Set-ExecutionPolicy -Scope Process Bypass
 .\scripts\bootstrap.ps1
 ```
 
-`.venv`가 만들어지고 `pyserial`, `PyQt5`, `pyqtgraph`, `numpy`, `pandas`, `scipy`가 설치된다.
+`.venv`가 만들어지고 `pyserial`, `PyQt5`, `pyqtgraph`, `numpy`, `pandas`,
+`scipy`, 로컬 모델 추론용 `torch`와 `torchvision`이 설치된다.
 
 설치 확인:
 
@@ -315,6 +316,20 @@ TX는 `csi_send`, RX는 `console_test` 펌웨어다. 펌웨어 변경과 재빌�
 ```powershell
 .\scripts\start-radar-monitor.ps1 -Port COM8
 ```
+
+스크립트는 기본적으로 `ml\v_main\model.pt`를 로컬에서 불러온다. 파일이 없거나
+`MODEL_SPEC.json`의 SHA-256과 다르면 ML만 `모델 사용 불가`로 표시되고 Radar와
+재실 모니터는 계속 동작한다. 모델이 정상 로드되면 RX의 LLFT 원시 CSI 출력도
+자동으로 활성화한다.
+
+GUI 실행 전 checkpoint와 PyTorch runtime을 확인할 수 있다.
+
+```powershell
+csi-gateway activity-model-check --project-root .
+```
+
+`status`가 `ok`이면 실제 checkpoint를 불러와 `950 x 52` 인공 입력으로 1회 추론한
+것이다. 이 결과 라벨은 정확도 평가가 아니다.
 
 정상이면 Radar 값과 링크 상태가 표시된다. 데이터 수집:
 

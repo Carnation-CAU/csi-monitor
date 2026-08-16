@@ -20,6 +20,10 @@ gui = [
   "pyqtgraph>=0.13,<0.15",
   "scipy>=1.13,<2",
 ]
+ml-runtime = [
+  "torch>=2.4,<3",
+  "torchvision>=0.19,<1",
+]
 
 [project.scripts]
 csi-gateway = "csi_gateway.cli:main"

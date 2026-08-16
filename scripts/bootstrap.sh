@@ -50,7 +50,7 @@ fi
 "$PYTHON_BIN" -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -e ".[gui]"
+python -m pip install -e ".[gui,ml-runtime]"
 
 echo "기본 Python 환경 구성이 완료되었습니다."
 echo "활성화: . .venv/bin/activate"

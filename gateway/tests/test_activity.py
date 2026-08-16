@@ -1,6 +1,13 @@
 import unittest
+from threading import Event
 import numpy as np
-from csi_gateway.activity import ActivityFrame,ActivityPrediction,FrameWindowEngine
+from csi_gateway.activity import (
+    ActivityFrame,
+    ActivityPrediction,
+    AsyncFrameWindowEngine,
+    FrameWindowEngine,
+    MotionInferenceGate,
+)
 from csi_gateway.csi import parse_csi_line
 
 class FakeModel:
@@ -25,4 +32,34 @@ class ActivityTest(unittest.TestCase):
         fields.append('"['+','.join(str(i%9-4) for i in range(104))+']"')
         sample=parse_csi_line(','.join(fields))
         self.assertIsNotNone(sample); self.assertEqual(sample.sequence,7); self.assertEqual(sample.amplitude.shape,(52,))
+    def test_motion_gate_keeps_tail_then_stops(self):
+        gate=MotionInferenceGate(tail_seconds=2.0)
+        self.assertTrue(gate.update(moving=True,now=1.0))
+        self.assertTrue(gate.update(moving=False,now=2.9))
+        self.assertFalse(gate.update(moving=False,now=3.1))
+        gate.update(moving=True,now=4.0)
+        gate.reset()
+        self.assertFalse(gate.update(moving=False,now=4.1))
+    def test_deactivate_can_discard_calibration_frames(self):
+        model=FakeModel(); engine=FrameWindowEngine(model,window_frames=2,inference_hz=10)
+        engine.append(ActivityFrame(1,"1",np.ones(52)))
+        self.assertEqual(engine.buffered_frames,1)
+        engine.clear()
+        self.assertEqual(engine.buffered_frames,0)
+    def test_async_deactivate_discards_in_flight_prediction(self):
+        started=Event(); release=Event()
+        class BlockingModel(FakeModel):
+            def predict(self,window):
+                started.set(); release.wait(1); return super().predict(window)
+        model=BlockingModel(); engine=AsyncFrameWindowEngine(model,window_frames=1,inference_hz=10)
+        try:
+            engine.submit(ActivityFrame(1,"1",np.ones(52)),moving=True,now=0)
+            self.assertTrue(started.wait(1))
+            future=engine._future
+            self.assertIsNotNone(future)
+            engine.deactivate(clear_frames=True); release.set(); future.result(timeout=1)
+            self.assertIsNone(engine.poll())
+            self.assertEqual(engine.window.buffered_frames,0)
+        finally:
+            release.set(); engine.close()
 if __name__=="__main__": unittest.main()

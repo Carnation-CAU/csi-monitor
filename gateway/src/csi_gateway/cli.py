@@ -8,6 +8,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
+from time import perf_counter
 from uuid import uuid4
 
 SCHEMA_VERSION = "1.0.0"
@@ -149,8 +150,20 @@ def build_parser() -> argparse.ArgumentParser:
     monitor_parser.add_argument("--baud", type=int, default=2_000_000)
     monitor_parser.add_argument("--project-root", default=".")
     monitor_parser.add_argument("--activity-model", help="Optional CNN checkpoint (.pt)")
-    monitor_parser.add_argument("--activity-hz", type=float, default=20.0)
-    monitor_parser.add_argument("--activity-window-frames", type=int, default=950)
+    monitor_parser.add_argument("--activity-hz", type=float, default=5.0)
+    monitor_parser.add_argument("--activity-window-frames", type=int)
+    monitor_parser.add_argument("--activity-tail-seconds", type=float, default=3.0)
+    monitor_parser.add_argument("--activity-fall-threshold", type=float, default=0.80)
+
+    model_check_parser = subparsers.add_parser(
+        "activity-model-check",
+        help="Validate the local activity checkpoint and run one inference",
+    )
+    model_check_parser.add_argument(
+        "--model", default="ml/v_main/model.pt", help="Checkpoint path"
+    )
+    model_check_parser.add_argument("--device", help="cpu, cuda, or mps")
+    model_check_parser.add_argument("--project-root", default=".")
 
     fall_alert_test_parser = subparsers.add_parser(
         "fall-alert-test", help="Send one test fall event to the app server"
@@ -210,6 +223,63 @@ def send_test_fall_alert(args: argparse.Namespace) -> int:
         print(f"테스트 이벤트 전송 실패: {exc}", file=sys.stderr)
         return 1
     print(f"앱 서버가 테스트 이벤트를 접수했습니다: {window_id}")
+    return 0
+
+
+def check_activity_model(args: argparse.Namespace) -> int:
+    """Load the production checkpoint and exercise its real inference path."""
+    import numpy as np
+
+    from .activity import ActivityWindow
+
+    project_root = Path(args.project_root).resolve()
+    model_path = Path(args.model)
+    if not model_path.is_absolute():
+        model_path = project_root / model_path
+    if str(project_root) not in sys.path:
+        sys.path.insert(0, str(project_root))
+    try:
+        from ml.runtime import TorchCnnActivityModel
+
+        model = TorchCnnActivityModel(model_path, device=args.device)
+        # This deterministic input checks deployment compatibility only. It is
+        # deliberately not presented as a classification-accuracy result.
+        synthetic = np.linspace(
+            -1.0,
+            1.0,
+            num=model.window_frames * 52,
+            dtype=np.float32,
+        ).reshape(model.window_frames, 52)
+        window = ActivityWindow(
+            synthetic,
+            first_sequence=1,
+            last_sequence=model.window_frames,
+            finished_at=utc_now(),
+        )
+        started = perf_counter()
+        prediction = model.predict(window)
+        elapsed_ms = (perf_counter() - started) * 1000
+    except Exception as exc:
+        print(f"행동 모델 점검 실패: {exc}", file=sys.stderr)
+        return 1
+    print(
+        json.dumps(
+            {
+                "status": "ok",
+                "model": str(model_path.resolve()),
+                "modelVersion": prediction.model_version,
+                "device": str(model.device),
+                "inputShape": [model.window_frames, 52],
+                "preprocessing": prediction.preprocessing_version,
+                "syntheticPrediction": prediction.label,
+                "scores": prediction.scores,
+                "inferenceMilliseconds": round(elapsed_ms, 2),
+                "note": "인공 입력 런타임 점검이며 실제 행동 정확도 평가가 아닙니다.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -290,9 +360,13 @@ def main(argv: list[str] | None = None) -> int:
             activity_model=args.activity_model,
             activity_hz=args.activity_hz,
             activity_window_frames=args.activity_window_frames,
+            activity_tail_seconds=args.activity_tail_seconds,
+            activity_fall_threshold=args.activity_fall_threshold,
         )
     if args.command == "fall-alert-test":
         return send_test_fall_alert(args)
+    if args.command == "activity-model-check":
+        return check_activity_model(args)
     if args.command == "features":
         return export_features(args)
     if args.command.startswith("dataset-"):
