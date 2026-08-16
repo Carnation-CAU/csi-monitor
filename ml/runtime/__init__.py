@@ -1,3 +1,3 @@
-from .torch_model import TorchCnnActivityModel
-__all__=["TorchCnnActivityModel"]
+from .torch_model import ActivityModelLoadError, TorchCnnActivityModel
 
+__all__ = ["ActivityModelLoadError", "TorchCnnActivityModel"]

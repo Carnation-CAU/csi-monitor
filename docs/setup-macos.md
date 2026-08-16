@@ -106,7 +106,8 @@ chmod +x scripts/*.sh
 사용할 Python: 3.12.10 (python3.12)
 ```
 
-이어서 `.venv`를 만들고 `pyserial`, `PyQt5`, `pyqtgraph`, `numpy`, `pandas`, `scipy`를 설치한다.
+이어서 `.venv`를 만들고 `pyserial`, `PyQt5`, `pyqtgraph`, `numpy`, `pandas`,
+`scipy`, 로컬 모델 추론용 `torch`와 `torchvision`을 설치한다.
 
 특정 버전을 강제하려면 `CSI_PYTHON`으로 지정한다.
 
@@ -311,6 +312,21 @@ idf.py -p /dev/cu.wchusbserial-RECEIVER -b 460800 flash
 ```bash
 ./scripts/start-radar-monitor.sh /dev/cu.wchusbserial-RECEIVER
 ```
+
+스크립트는 기본적으로 `ml/v_main/model.pt`를 로컬에서 불러온다. 파일이 없거나
+`MODEL_SPEC.json`의 SHA-256과 다르면 ML만 `모델 사용 불가`로 표시되고 Radar와
+재실 모니터는 계속 동작한다. Apple Silicon에서 MPS 추론이 지원되지 않는 연산을
+만나면 자동으로 CPU로 전환한다. 모델이 정상 로드되면 RX의 LLFT 원시 CSI 출력도
+자동으로 활성화한다.
+
+GUI 실행 전 checkpoint와 PyTorch runtime을 확인할 수 있다.
+
+```bash
+csi-gateway activity-model-check --project-root .
+```
+
+`status`가 `ok`이면 실제 checkpoint를 불러와 `950 x 52` 인공 입력으로 1회 추론한
+것이다. 이 결과 라벨은 정확도 평가가 아니다.
 
 데이터 수집:
 

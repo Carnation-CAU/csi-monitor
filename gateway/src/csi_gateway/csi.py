@@ -4,6 +4,10 @@ import csv,json
 from dataclasses import dataclass
 import numpy as np
 
+RAW_CSI_ENABLE_COMMAND = (
+    "radar --csi_output_type LLFT --csi_output_format decimal"
+)
+
 @dataclass(frozen=True)
 class CsiFrameSample:
     sequence: int
@@ -25,4 +29,3 @@ def parse_csi_line(line: bytes|str) -> CsiFrameSample|None:
         pairs=iq.reshape(52,2)
         return CsiFrameSample(int(fields[1]),fields[2],int(fields[21]),int(fields[6]),int(fields[19]),np.hypot(pairs[:,0],pairs[:,1]).astype(np.float32))
     except (ValueError,TypeError,json.JSONDecodeError,csv.Error): return None
-

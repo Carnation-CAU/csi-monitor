@@ -18,7 +18,8 @@ ESP32-S3 송신기 → ESP32-S3 CSI 수신기 → PC 수집기
 - 공식 `someone`·`moving`과 공간 전용 상대 `wander` 기준을 이용한 실험용 재실·부재 상태 안정화
 - 종료 후 실제 행동을 확정하는 안내형 수집과 특징 CSV 생성
 - 평상시 움직임·정지 전이와 낙상 의심 이벤트의 날짜별 자동 기록
-- 충격성 변화 후 8초간 회복 움직임이 없을 때 앱 서버로 낙상 의심 이벤트 전송
+- `v_main` PyTorch 모델의 Windows/macOS 로컬 행동 추론과 겹치는 window 사건 집계
+- ML 낙상 후보와 충격 후 8초간 무회복 Radar 근거가 일치할 때 앱 서버로 이벤트 전송
 - ESP-IDF 없이 업로드 가능한 완성 펌웨어 (`firmware/prebuilt`)
 - Espressif `esp-csi` 고정 커밋과 프로젝트 패치
 

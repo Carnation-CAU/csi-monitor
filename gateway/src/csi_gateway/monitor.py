@@ -78,7 +78,8 @@ from .radar import (
 )
 from .prototype import predict_action
 from .activity import ActivityFrame, AsyncFrameWindowEngine
-from .csi import parse_csi_line
+from .activity_events import ActivityEventAggregator
+from .csi import RAW_CSI_ENABLE_COMMAND, parse_csi_line
 
 def run_monitor(
     port: str,
@@ -86,8 +87,10 @@ def run_monitor(
     project_root: str = ".",
     *,
     activity_model: str | None = None,
-    activity_hz: float = 20.0,
-    activity_window_frames: int = 950,
+    activity_hz: float = 5.0,
+    activity_window_frames: int | None = None,
+    activity_tail_seconds: float = 3.0,
+    activity_fall_threshold: float = 0.80,
 ) -> int:
     import pyqtgraph as pg
     from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -120,9 +123,10 @@ def run_monitor(
         raw_line_received = pyqtSignal(bytes)
         read_error = pyqtSignal(str)
 
-        def __init__(self) -> None:
+        def __init__(self, *, enable_raw_csi: bool = False) -> None:
             super().__init__()
             self.commands: Queue[str] = Queue()
+            self.enable_raw_csi = enable_raw_csi
 
         def send_command(self, command: str) -> None:
             self.commands.put(command)
@@ -131,6 +135,10 @@ def run_monitor(
             try:
                 with Serial(port, baud, timeout=0.2) as serial_port:
                     serial_port.write(b"rf_channel\r\n")
+                    if self.enable_raw_csi:
+                        serial_port.write(
+                            f"{RAW_CSI_ENABLE_COMMAND}\r\n".encode("utf-8")
+                        )
                     while not self.isInterruptionRequested():
                         try:
                             command = self.commands.get_nowait()
@@ -197,16 +205,40 @@ def run_monitor(
             self.last_link_sample: LinkSample | None = None
             self.current_moving = False
             self.activity_engine = None
+            self.activity_aggregator = None
+            self.activity_model_error: str | None = None
+            self.activity_window_frames = activity_window_frames or 950
+            self.activity_model_device = ""
+            self.csi_frame_count = 0
+            self.last_csi_at = 0.0
             if activity_model:
-                if str(self.project_root) not in sys.path:
-                    sys.path.insert(0, str(self.project_root))
-                from ml.runtime import TorchCnnActivityModel
-                backend = TorchCnnActivityModel(activity_model)
-                self.activity_engine = AsyncFrameWindowEngine(
-                    backend,
-                    window_frames=activity_window_frames,
-                    inference_hz=activity_hz,
-                )
+                try:
+                    if str(self.project_root) not in sys.path:
+                        sys.path.insert(0, str(self.project_root))
+                    from ml.runtime import TorchCnnActivityModel
+
+                    backend = TorchCnnActivityModel(activity_model)
+                    if (
+                        activity_window_frames is not None
+                        and activity_window_frames != backend.window_frames
+                    ):
+                        raise ValueError(
+                            "실행 window와 checkpoint 입력 크기가 다릅니다: "
+                            f"실행={activity_window_frames}, 모델={backend.window_frames}"
+                        )
+                    self.activity_window_frames = backend.window_frames
+                    self.activity_model_device = str(backend.device)
+                    self.activity_engine = AsyncFrameWindowEngine(
+                        backend,
+                        window_frames=backend.window_frames,
+                        inference_hz=activity_hz,
+                        tail_seconds=activity_tail_seconds,
+                    )
+                    self.activity_aggregator = ActivityEventAggregator(
+                        fall_score_threshold=activity_fall_threshold,
+                    )
+                except Exception as exc:
+                    self.activity_model_error = str(exc)
             self.calibrating = False
             self.calibration_stage = ""
             self.calibration_remaining = 0
@@ -263,10 +295,16 @@ def run_monitor(
                 "background:#495057;color:white;padding:10px;border-radius:6px;"
             )
 
-            self.activity_status = QLabel(
-                "행동 분류: 모델 대기" if self.activity_engine is None else
-                f"행동 분류: 최근 {activity_window_frames}프레임 준비 중"
-            )
+            if self.activity_model_error:
+                activity_text = f"행동 분류: 모델 사용 불가 · {self.activity_model_error}"
+            elif self.activity_engine is None:
+                activity_text = "행동 분류: 모델 미설정 · Radar 감지만 사용"
+            else:
+                activity_text = (
+                    "행동 분류: 원시 CSI 대기 · LLFT 자동 활성화 · "
+                    f"{self.activity_model_device}"
+                )
+            self.activity_status = QLabel(activity_text)
             self.activity_status.setAlignment(Qt.AlignCenter)
             self.activity_status.setFont(QFont("Arial", 13, QFont.Bold))
             self.activity_status.setStyleSheet(
@@ -446,7 +484,7 @@ def run_monitor(
             container.setLayout(layout)
             self.setCentralWidget(container)
 
-            self.reader = SerialReader()
+            self.reader = SerialReader(enable_raw_csi=self.activity_engine is not None)
             self.reader.sample_received.connect(self.update_sample)
             self.reader.link_received.connect(self.update_link)
             self.reader.channel_received.connect(self.update_channel)
@@ -506,9 +544,8 @@ def run_monitor(
                 self.live_detector = self.build_live_detector()
 
         def build_live_detector(self) -> LiveActionDetector:
-            # 공개 데이터 모델은 아직 운영 성능이 검증되지 않았다. 지금은 공식
-            # Radar moving 신호를 안정화하고, 후속 ML은 detector의 classifier
-            # 주입 계약으로 교체한다.
+            # Radar 규칙은 ML과 독립적으로 계속 동작한다. model.pt가 활성화된
+            # 경우 monitor가 Radar 낙상 후보를 ML 행동 사건과 결합한다.
             return LiveActionDetector()
 
         def refresh_profile_list(self, selected_profile_id: str) -> None:
@@ -1140,14 +1177,29 @@ def run_monitor(
             sample = parse_csi_line(raw_line)
             if sample is None:
                 return
+            self.csi_frame_count += 1
+            self.last_csi_at = monotonic()
+            suspended = self.scanning_channels or self.calibrating or self.collecting
+            if suspended:
+                self.activity_engine.deactivate(clear_frames=True)
+                if self.activity_aggregator is not None:
+                    self.activity_aggregator.reset()
+                return
             self.activity_engine.submit(
                 ActivityFrame(sample.sequence, sample.timestamp, sample.amplitude),
-                moving=self.current_moving,
+                moving=self.current_moving and not suspended,
             )
 
         def poll_activity_prediction(self) -> None:
             if self.activity_engine is None:
                 return
+            if self.scanning_channels or self.calibrating or self.collecting:
+                try:
+                    self.activity_engine.poll()
+                except Exception:
+                    pass
+                return
+            now = monotonic()
             try:
                 prediction = self.activity_engine.poll()
             except Exception as exc:
@@ -1157,14 +1209,48 @@ def run_monitor(
                 )
                 return
             if prediction is None:
-                if not self.activity_engine.window.ready:
+                if self.activity_aggregator is not None:
+                    for event in self.activity_aggregator.expire(now):
+                        self.handle_live_detection(event)
+                if self.csi_frame_count == 0:
+                    self.activity_status.setText(
+                        "행동 분류: 원시 CSI 대기 · LLFT 자동 활성화 명령 전송됨"
+                    )
+                    self.activity_status.setStyleSheet(
+                        "background:#495057;color:white;padding:10px;border-radius:6px;"
+                    )
+                elif now - self.last_csi_at > 2.0:
+                    self.activity_status.setText(
+                        "행동 분류: 원시 CSI 수신 중단 · RX 연결과 펌웨어 확인 필요"
+                    )
+                    self.activity_status.setStyleSheet(
+                        "background:#b42318;color:white;padding:10px;border-radius:6px;"
+                    )
+                elif not self.activity_engine.window.ready:
                     remaining = self.activity_engine.window.window_frames - self.activity_engine.window.buffered_frames
                     self.activity_status.setText(f"행동 분류: 최근 프레임 준비 중 · {remaining}개 남음")
+                    self.activity_status.setStyleSheet(
+                        "background:#495057;color:white;padding:10px;border-radius:6px;"
+                    )
+                else:
+                    self.activity_status.setText(
+                        "행동 분류: 모델 준비됨 · Radar 움직임 대기"
+                    )
+                    self.activity_status.setStyleSheet(
+                        "background:#087f3d;color:white;padding:10px;border-radius:6px;"
+                    )
                 return
             scores = " · ".join(f"{name} {value * 100:.0f}%" for name,value in prediction.scores.items())
             self.activity_status.setText(f"행동 분류: {prediction.label} · {scores}")
             color = "#b42318" if prediction.label == "fall_suspected" else "#175cd3"
             self.activity_status.setStyleSheet(f"background:{color};color:white;padding:10px;border-radius:6px;")
+            if self.activity_aggregator is not None:
+                for event in self.activity_aggregator.observe(
+                    prediction,
+                    observed_at=now,
+                    detected_at=utc_now(),
+                ):
+                    self.handle_live_detection(event)
 
         def finish_collection(
             self,
@@ -1882,7 +1968,23 @@ def run_monitor(
                     presence_state=presence_state,
                     presence_probability=presence.presence_ratio,
                 ):
-                    self.handle_live_detection(detected_event)
+                    if (
+                        detected_event.event_type == "fall_suspected"
+                        and self.activity_aggregator is not None
+                    ):
+                        fused = self.activity_aggregator.fuse_radar_fall(
+                            detected_event,
+                            observed_at=now,
+                        )
+                        self.handle_live_detection(
+                            fused
+                            if fused is not None
+                            else self.activity_aggregator.radar_candidate(
+                                detected_event
+                            )
+                        )
+                    else:
+                        self.handle_live_detection(detected_event)
 
             if self.scanning_channels or self.collecting:
                 pass

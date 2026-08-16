@@ -120,9 +120,26 @@ Set-ExecutionPolicy -Scope Process Bypass
 ### 3.2 평상시 자동 행동 기록과 낙상 의심 알림
 
 빈 공간 보정이 완료된 프로필에서는 별도의 `행동 수집 시작` 버튼을 누르지 않아도
-모니터가 평상시 Radar 표본을 계속 확인한다. 최근 8초 창에서 공식 `moving` 결과가
-안정되면 `moving` 또는 `static` 전이를 기록한다. 행동 수집, 채널 비교와 빈 공간
+모니터가 평상시 Radar 표본과 `ml/v_main/model.pt`를 함께 사용한다. 최근 950개
+CSI amplitude 프레임을 background worker에서 로컬 추론하고, 공식 `moving`이
+끝난 뒤에도 3초 동안 tail window를 확인한다. 행동 수집, 채널 비교와 빈 공간
 보정 중에는 실험 동작을 실제 알림으로 오인하지 않도록 자동 감지를 잠시 멈춘다.
+모델이 정상 로드되면 모니터가 RX에 LLFT decimal 원시 CSI 출력을 자동으로
+활성화한다. 별도의 공식 ESP-Radar GUI에서 raw display를 켤 필요가 없다.
+
+모니터를 열기 전에 checkpoint 자체를 바로 확인하려면 다음 명령을 실행한다.
+
+```powershell
+csi-gateway activity-model-check --project-root .
+```
+
+```bash
+csi-gateway activity-model-check --project-root .
+```
+
+`status: ok`, 모델 버전, 실행 장치와 `inputShape: [950, 52]`가 출력되면 로컬
+runtime 경로가 정상이다. 함께 출력되는 `syntheticPrediction`은 인공 입력에 대한
+구동 점검 결과일 뿐 행동 정확도 수치가 아니다.
 
 자동 기록은 날짜별 JSON Lines 파일에 추가된다.
 
@@ -134,11 +151,16 @@ data/events/YYYY-MM-DD.jsonl
 들어간다. 낙상 의심 알림의 `sending`, `delivered`, `failed`, `skipped` 전달 결과도
 같은 파일에 남으므로 앱 서버 장애와 미설정 상태를 나중에 확인할 수 있다.
 
-초기 낙상 후보 규칙은 `jitter / move_threshold`가 2.5 이상인 충격성 움직임 뒤
-8초 동안 움직임 표본 비율이 20% 이하인 경우다. 같은 사건은 60초 동안 다시
-알리지 않는다. 이 값은 임상적으로 검증된 낙상 판정이 아니며 화면과 앱에서는
-항상 `낙상 의심`으로 표현한다. 실제 생활 환경에서 앉기, 눕기, 물건 줍기와 큰 팔
-동작을 포함해 시간당 오탐률을 측정한 뒤 임계값을 조정해야 한다.
+겹치는 window에서 나온 ML 낙상 결과는 여러 번의 낙상이 아니라 한 행동 사건으로
+묶는다. ML `fall_suspected` score 0.8 이상인 사건과 Radar의
+`jitter / move_threshold` 2.5 이상 충격 후 8초간 회복 움직임 없음이 15초 안에서
+일치할 때만 최종 낙상 의심 알림을 보낸다. 한쪽 근거만 있으면 후보로 기록하고
+알림은 보내지 않는다. 같은 최종 사건은 60초 동안 다시 알리지 않는다.
+
+0.8은 공개 ESP32-C3 모델을 ESP32-S3 실시간 파이프라인에 연결하기 위한 초기
+통합 기준이며 보정된 안전 확률이 아니다. 실제 생활 환경에서 앉기, 눕기, 물건
+줍기와 큰 팔 동작을 포함해 시간당 오탐률과 낙상 recall을 측정한 뒤 validation
+데이터로 조정해야 한다.
 
 앱 서버 주소는 GUI의 `낙상 알림 서버`에 입력하거나 실행 전에 환경 변수로 준다.
 

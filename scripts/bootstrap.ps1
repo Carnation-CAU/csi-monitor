@@ -62,7 +62,7 @@ $VenvPython = if (Test-Path ".\.venv\Scripts\python.exe") {
 if ($LASTEXITCODE -ne 0) {
     throw "pip 업그레이드에 실패했습니다."
 }
-& $VenvPython -m pip install -e ".[gui]"
+& $VenvPython -m pip install -e ".[gui,ml-runtime]"
 if ($LASTEXITCODE -ne 0) {
     throw "프로젝트 의존성 설치에 실패했습니다."
 }

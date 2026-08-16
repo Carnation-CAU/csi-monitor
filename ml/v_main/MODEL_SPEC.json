@@ -54,9 +54,12 @@
   },
   "runtime": {
     "adapter": "ml.runtime.TorchCnnActivityModel",
-    "default_inference_hz": 20,
+    "default_inference_hz": 5,
     "window_frames": 950,
-    "device": "CUDA when available, otherwise CPU"
+    "motion_tail_seconds": 3.0,
+    "integration_fall_score_threshold": 0.8,
+    "alert_fusion_rule": "ml_and_radar_v1",
+    "device": "CUDA, then MPS, then CPU with MPS-to-CPU runtime fallback"
   },
   "limitations": [
     "Public ESP-Fi HAR uses ESP32-C3 data rather than the target ESP32-S3 deployment.",
