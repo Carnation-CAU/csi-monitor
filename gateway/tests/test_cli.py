@@ -38,6 +38,7 @@ from csi_gateway.profiles import (
     load_or_create_profile,
     save_profile,
     update_profile_calibration,
+    update_profile_channel,
     update_profile_details,
     update_profile_rx_mac,
 )
@@ -285,6 +286,36 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(restored["displayName"], "안방 침실")
             self.assertFalse(restored["needsCalibration"])
             self.assertIsNotNone(restored["calibration"])
+
+    def test_profile_channel_change_invalidates_calibration(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = create_profile(
+                root,
+                display_name="침실",
+                placement_description="침대 양쪽",
+                distance_meters=1.8,
+                channel=1,
+            )
+            update_profile_calibration(
+                root, profile, someone_threshold=0.1, move_threshold=0.2
+            )
+
+            update_profile_channel(root, profile, 6)
+
+            restored = load_profile(root, profile["profileId"])
+            self.assertEqual(restored["radio"]["channel"], 6)
+            self.assertTrue(restored["needsCalibration"])
+            self.assertIsNone(restored["calibration"])
+            self.assertIn("Wi-Fi 채널 변경: 1 → 6", restored["notes"][-1])
+
+    def test_profile_channel_rejects_unsupported_channel(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = load_or_create_profile(root)
+
+            with self.assertRaises(ValueError):
+                update_profile_channel(root, profile, 3)
 
     def test_profile_placement_edit_invalidates_calibration(self):
         with tempfile.TemporaryDirectory() as temp_dir:

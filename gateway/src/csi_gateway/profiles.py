@@ -146,9 +146,16 @@ def save_profile(project_root: Path, profile: dict[str, Any]) -> Path:
 def update_profile_channel(
     project_root: Path, profile: dict[str, Any], channel: int
 ) -> Path:
+    if channel not in {1, 6, 11}:
+        raise ValueError("channel must be one of 1, 6, or 11")
+    previous_channel = profile["radio"].get("channel")
     profile["radio"]["channel"] = channel
     profile["calibration"] = None
     profile["needsCalibration"] = True
+    if previous_channel != channel:
+        profile.setdefault("notes", []).append(
+            f"Wi-Fi 채널 변경: {previous_channel} → {channel}, 빈 공간 보정 다시 필요"
+        )
     return save_profile(project_root, profile)
 
 
