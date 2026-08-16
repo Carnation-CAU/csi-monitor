@@ -53,3 +53,8 @@ data/events/**
 !data/events/.gitkeep
 
 third_party/esp-csi/
+
+# 공개 ML 원본도 용량과 재배포 조건 때문에 Git에 올리지 않는다.
+# loader, checksum, 출처와 설치 절차만 저장소에서 관리한다.
+ml/dataset/raw/**
+!ml/dataset/raw/.gitkeep

@@ -1,3 +1,15 @@
-# 머신러닝
+# CSI 행동 분류 ML
 
-실제 CSI 기준선 데이터와 고정된 실험 분할이 준비된 뒤 구현한다. 첫 비교 모델은 규칙 기반 기준선, 로지스틱 회귀·랜덤 포레스트, 1D CNN 순서로 진행한다.
+목표는 재실이 확인된 구간에서 `fall`, `walking`, `other_motion`을 분류하는 것이다. 재실 판단은 이 모듈의 책임이 아니다.
+
+현재 진행 상태:
+
+- v0~v0.1: ESP-Fi 데이터 타당성과 오류 분석
+- v1~v1.1: 통계 특징 기반 계층 분류와 행동 범위 실험
+- v2: DTW 특징 실험
+- v3: gateway가 자른 실제 이벤트 구간 검증
+- v4: 고전 ML 모델 비교
+- v5: raw CSI CNN backbone과 단일 split 기준선
+- v5.1: 3개 공개 데이터셋 × 3개 CNN × 4-fold GPU 학습
+
+공개 데이터 현황과 공통 라벨은 [`dataset/README.md`](dataset/README.md), 전체 개발 전략은 [`strategy.md`](strategy.md), 실습실 PC 학습 방법은 [`v5_1/LAB_TRAINING.md`](v5_1/LAB_TRAINING.md)를 참고한다.

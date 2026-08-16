@@ -77,8 +77,18 @@ from .radar import (
     parse_radar_line,
 )
 from .prototype import predict_action
+from .activity import ActivityFrame, AsyncFrameWindowEngine
+from .csi import parse_csi_line
 
-def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
+def run_monitor(
+    port: str,
+    baud: int,
+    project_root: str = ".",
+    *,
+    activity_model: str | None = None,
+    activity_hz: float = 20.0,
+    activity_window_frames: int = 950,
+) -> int:
     import pyqtgraph as pg
     from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
     from PyQt5.QtGui import QFont
@@ -185,6 +195,18 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.last_sample_at = 0.0
             self.last_link_at = 0.0
             self.last_link_sample: LinkSample | None = None
+            self.current_moving = False
+            self.activity_engine = None
+            if activity_model:
+                if str(self.project_root) not in sys.path:
+                    sys.path.insert(0, str(self.project_root))
+                from ml.runtime import TorchCnnActivityModel
+                backend = TorchCnnActivityModel(activity_model)
+                self.activity_engine = AsyncFrameWindowEngine(
+                    backend,
+                    window_frames=activity_window_frames,
+                    inference_hz=activity_hz,
+                )
             self.calibrating = False
             self.calibration_stage = ""
             self.calibration_remaining = 0
@@ -238,6 +260,16 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.action_status.setAlignment(Qt.AlignCenter)
             self.action_status.setFont(QFont("Arial", 13, QFont.Bold))
             self.action_status.setStyleSheet(
+                "background:#495057;color:white;padding:10px;border-radius:6px;"
+            )
+
+            self.activity_status = QLabel(
+                "행동 분류: 모델 대기" if self.activity_engine is None else
+                f"행동 분류: 최근 {activity_window_frames}프레임 준비 중"
+            )
+            self.activity_status.setAlignment(Qt.AlignCenter)
+            self.activity_status.setFont(QFont("Arial", 13, QFont.Bold))
+            self.activity_status.setStyleSheet(
                 "background:#495057;color:white;padding:10px;border-radius:6px;"
             )
 
@@ -399,6 +431,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             layout.addWidget(self.status)
             layout.addWidget(self.presence_status)
             layout.addWidget(self.action_status)
+            layout.addWidget(self.activity_status)
             layout.addWidget(self.link_status)
             layout.addWidget(self.channel_status)
             layout.addWidget(self.details)
@@ -420,12 +453,17 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             self.reader.calibration_received.connect(self.update_calibration_result)
             self.reader.device_mac_received.connect(self.update_device_mac)
             self.reader.raw_line_received.connect(self.record_raw_line)
+            self.reader.raw_line_received.connect(self.process_activity_frame)
             self.reader.read_error.connect(self.show_error)
             self.reader.start()
 
             self.health_timer = QTimer(self)
             self.health_timer.timeout.connect(self.update_health)
             self.health_timer.start(500)
+
+            self.activity_timer = QTimer(self)
+            self.activity_timer.timeout.connect(self.poll_activity_prediction)
+            self.activity_timer.start(20)
 
             self.calibration_timer = QTimer(self)
             self.calibration_timer.timeout.connect(self.calibration_tick)
@@ -1096,6 +1134,38 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                 ),
             )
 
+        def process_activity_frame(self, raw_line: bytes) -> None:
+            if self.activity_engine is None:
+                return
+            sample = parse_csi_line(raw_line)
+            if sample is None:
+                return
+            self.activity_engine.submit(
+                ActivityFrame(sample.sequence, sample.timestamp, sample.amplitude),
+                moving=self.current_moving,
+            )
+
+        def poll_activity_prediction(self) -> None:
+            if self.activity_engine is None:
+                return
+            try:
+                prediction = self.activity_engine.poll()
+            except Exception as exc:
+                self.activity_status.setText(f"행동 분류 오류: {exc}")
+                self.activity_status.setStyleSheet(
+                    "background:#b42318;color:white;padding:10px;border-radius:6px;"
+                )
+                return
+            if prediction is None:
+                if not self.activity_engine.window.ready:
+                    remaining = self.activity_engine.window.window_frames - self.activity_engine.window.buffered_frames
+                    self.activity_status.setText(f"행동 분류: 최근 프레임 준비 중 · {remaining}개 남음")
+                return
+            scores = " · ".join(f"{name} {value * 100:.0f}%" for name,value in prediction.scores.items())
+            self.activity_status.setText(f"행동 분류: {prediction.label} · {scores}")
+            color = "#b42318" if prediction.label == "fall_suspected" else "#175cd3"
+            self.activity_status.setStyleSheet(f"background:{color};color:white;padding:10px;border-radius:6px;")
+
         def finish_collection(
             self,
             *,
@@ -1759,6 +1829,7 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
             now = monotonic()
             self.last_sample_at = now
             self.last_link_at = self.last_sample_at
+            self.current_moving = sample.moving
             self.jitter_values.append(sample.jitter)
             self.threshold_values.append(sample.move_threshold)
             if self.scanning_channels and self.scan_phase == "measuring":
@@ -1952,6 +2023,8 @@ def run_monitor(port: str, baud: int, project_root: str = ".") -> int:
                     self.collecting = False
             self.reader.requestInterruption()
             self.reader.wait(1000)
+            if self.activity_engine is not None:
+                self.activity_engine.close()
             event.accept()
 
     app = QApplication(sys.argv)

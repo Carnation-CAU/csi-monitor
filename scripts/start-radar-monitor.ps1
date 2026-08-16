@@ -1,5 +1,8 @@
-﻿param(
-    [Parameter(Mandatory = $true)][string]$Port
+param(
+    [Parameter(Mandatory = $true)][string]$Port,
+    [string]$ActivityModel = "",
+    [double]$ActivityHz = 20,
+    [int]$ActivityWindowFrames = 950
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,4 +14,15 @@ if (-not (Test-Path -LiteralPath $Python)) {
 }
 
 Set-Location $ProjectRoot
-& $Python -m csi_gateway monitor --port $Port --baud 2000000 --project-root $ProjectRoot
+$Arguments = @(
+    "-m", "csi_gateway", "monitor",
+    "--port", $Port,
+    "--baud", "2000000",
+    "--project-root", $ProjectRoot,
+    "--activity-hz", $ActivityHz,
+    "--activity-window-frames", $ActivityWindowFrames
+)
+if ($ActivityModel) {
+    $Arguments += @("--activity-model", $ActivityModel)
+}
+& $Python @Arguments

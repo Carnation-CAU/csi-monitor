@@ -10,7 +10,11 @@ $PythonCommand = $null
 
 if (Get-Command py -ErrorAction SilentlyContinue) {
     foreach ($Version in $PreferredVersions) {
-        & py "-$Version" -c "import sys" 2>$null
+        try {
+            & py "-$Version" -c "import sys" 2>$null
+        } catch {
+            continue
+        }
         if ($LASTEXITCODE -eq 0) {
             $PythonCommand = @("py", "-$Version")
             break

@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "status": "public-data integration candidate",
+  "model_file": "model.pt",
+  "model_sha256": "e9f2573dfc98d54c6b60f1dbc495da2b6e25650764d8787a51128917a9390d1f",
+  "model_version": "v5.1-efficientnet-b0-espfi-cv-fold1-20260816",
+  "architecture": "efficientnet_b0",
+  "framework": "PyTorch",
+  "source": {
+    "experiment": "ml/v5_1",
+    "dataset": "ESP-Fi HAR",
+    "checkpoint": "ml/v5_1/output/cross_validation/espfi/efficientnet_b0/fold-1/best.pt",
+    "selection_rule": "architecture by highest four-fold mean test macro-F1; checkpoint by highest validation macro-F1 without using its test score",
+    "validation_macro_f1": 0.9227692673079207,
+    "cross_validation_test_macro_f1_mean": 0.9074943704616917,
+    "cross_validation_test_macro_f1_std": 0.012167084993204786,
+    "cross_validation_fall_recall_mean": 0.8687499999999999,
+    "cross_validation_fall_f1_mean": 0.8352426913411478
+  },
+  "input": {
+    "name": "amplitude",
+    "dtype": "float32",
+    "shape": [950, 52],
+    "axis_order": ["time", "subcarrier"],
+    "description": "950 consecutive ESP32 CSI amplitude frames with 52 subcarriers"
+  },
+  "preprocessing": {
+    "version": "amplitude-zscore-v1",
+    "operation": "per-window, per-subcarrier z-score",
+    "epsilon": 0.000001,
+    "caller_must_normalize": false
+  },
+  "labels": {
+    "internal": ["fall", "walking", "other_motion"],
+    "external": ["fall_suspected", "walking", "other_motion"],
+    "mapping": {
+      "fall": "fall_suspected",
+      "walking": "walking",
+      "other_motion": "other_motion"
+    }
+  },
+  "output": {
+    "type": "csi_gateway.activity.ActivityPrediction",
+    "fields": [
+      "label",
+      "scores",
+      "confidence",
+      "first_sequence",
+      "last_sequence",
+      "window_finished_at",
+      "model_version",
+      "preprocessing_version"
+    ]
+  },
+  "runtime": {
+    "adapter": "ml.runtime.TorchCnnActivityModel",
+    "default_inference_hz": 20,
+    "window_frames": 950,
+    "device": "CUDA when available, otherwise CPU"
+  },
+  "limitations": [
+    "Public ESP-Fi HAR uses ESP32-C3 data rather than the target ESP32-S3 deployment.",
+    "The selected checkpoint is a cross-validation fold checkpoint, not a full-data refit.",
+    "Environment-grouped validation and a locked local ESP32-S3 test are still required.",
+    "Scores are model softmax probabilities and are not calibrated safety probabilities."
+  ]
+}
