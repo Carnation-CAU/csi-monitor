@@ -1,13 +1,22 @@
-import sys,unittest
+import csv,sys,tempfile,unittest
 from pathlib import Path
 PROJECT=Path(__file__).resolve().parents[2]
 if str(PROJECT) not in sys.path: sys.path.insert(0,str(PROJECT))
 from collections import Counter
 from ml.v5.data_sources import load_spec
 from ml.v5.models import make_model
+from ml.v5.cross_validate import write_csv
 import torch
 
 class V51Test(unittest.TestCase):
+    def test_csv_writer_accepts_dataset_specific_metrics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target=Path(directory)/"summary.csv"
+            write_csv(target,[{"dataset":"espfi","fall_f1":.8},{"dataset":"csi_har","walking_recall":.9}])
+            with target.open(encoding="utf-8-sig",newline="") as f: rows=list(csv.DictReader(f))
+            self.assertEqual(rows[0]["fall_f1"],"0.8")
+            self.assertEqual(rows[1]["walking_recall"],"0.9")
+
     def test_all_dataset_folds_are_disjoint_and_have_all_classes(self):
         for dataset in ("espfi","ut_har","csi_har"):
             spec=load_spec(dataset)

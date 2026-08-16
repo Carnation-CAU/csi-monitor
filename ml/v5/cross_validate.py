@@ -37,8 +37,9 @@ def args_parser():
 
 def write_csv(path,rows):
     path.parent.mkdir(parents=True,exist_ok=True)
+    fieldnames=list(dict.fromkeys(key for row in rows for key in row))
     with path.open("w",encoding="utf-8-sig",newline="") as f:
-        writer=csv.DictWriter(f,fieldnames=list(rows[0])); writer.writeheader(); writer.writerows(rows)
+        writer=csv.DictWriter(f,fieldnames=fieldnames); writer.writeheader(); writer.writerows(rows)
 
 def limited(samples,maximum=64):
     result=[]; by_label={label:[s for s in samples if s.label==label] for label in sorted({s.label for s in samples})}
