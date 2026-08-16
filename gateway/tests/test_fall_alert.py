@@ -7,6 +7,7 @@ from urllib.error import HTTPError, URLError
 from csi_gateway.fall_alert import (
     FallAlertError,
     build_collection_fall_event,
+    build_detected_fall_event,
     normalize_event_endpoint,
     send_fall_event,
 )
@@ -27,6 +28,35 @@ class FakeResponse:
 
 
 class FallAlertTest(unittest.TestCase):
+    def test_builds_live_detection_contract_event(self):
+        event = build_detected_fall_event(
+            window_id="fall-live-01",
+            detected_at="2026-08-16T15:30:00+09:00",
+            room_id="living-room",
+            risk_score=0.81,
+            motion_confidence=0.84,
+            presence_state="present",
+            presence_probability=0.78,
+            no_recovery_sec=8.0,
+        )
+
+        self.assertEqual(event["window_id"], "fall-live-01")
+        self.assertEqual(event["risk_score"], 0.81)
+        self.assertEqual(event["evidence"]["no_recovery_sec"], 8.0)
+
+    def test_rejects_out_of_range_live_confidence(self):
+        with self.assertRaisesRegex(ValueError, "risk_score"):
+            build_detected_fall_event(
+                window_id="fall-live-01",
+                detected_at="2026-08-16T15:30:00+09:00",
+                room_id="living-room",
+                risk_score=1.1,
+                motion_confidence=0.8,
+                presence_state="present",
+                presence_probability=0.8,
+                no_recovery_sec=8.0,
+            )
+
     def test_builds_contract_event_from_confirmed_collection(self):
         event = build_collection_fall_event(
             session_id="trial-01",

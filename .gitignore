@@ -42,6 +42,7 @@ data/processed/**
 data/profiles/**
 data/datasets/**
 data/exports/**
+data/events/**
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/manifests/.gitkeep
@@ -49,5 +50,6 @@ data/exports/**
 !data/profiles/.gitkeep
 !data/datasets/.gitkeep
 !data/exports/.gitkeep
+!data/events/.gitkeep
 
 third_party/esp-csi/

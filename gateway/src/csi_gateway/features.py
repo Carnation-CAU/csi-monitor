@@ -7,7 +7,7 @@ from statistics import fmean, pstdev
 from .collection import COLLECTION_LABELS
 from .datasets import dataset_path, load_dataset
 from .profiles import load_profile
-from .radar import parse_link_line, parse_radar_line
+from .radar import LinkSample, RadarSample, parse_link_line, parse_radar_line
 
 
 def _mean(values: list[float]) -> float:
@@ -22,19 +22,12 @@ def _relative(value: float, threshold: float) -> float:
     return value / threshold if abs(threshold) > 1e-12 else 0.0
 
 
-def extract_session_features(raw_path: Path) -> dict[str, float]:
-    radar_samples = []
-    link_samples = []
-    for line in raw_path.read_text(encoding="utf-8").splitlines():
-        record = json.loads(line)
-        raw = str(record.get("raw", ""))
-        radar = parse_radar_line(raw)
-        if radar is not None:
-            radar_samples.append(radar)
-        link = parse_link_line(raw)
-        if link is not None:
-            link_samples.append(link)
-
+def extract_radar_features(
+    radar_samples: list[RadarSample],
+    link_samples: list[LinkSample] | None = None,
+) -> dict[str, float]:
+    """세션 파일과 실시간 창이 공유하는 행동 특징을 계산한다."""
+    link_samples = link_samples or []
     wanders = [sample.wander for sample in radar_samples]
     jitters = [sample.jitter for sample in radar_samples]
     relative_wanders = [
@@ -72,6 +65,21 @@ def extract_session_features(raw_path: Path) -> dict[str, float]:
         "packet_hz_mean": _mean(frequencies),
         "packet_hz_min": min(frequencies, default=0.0),
     }
+
+
+def extract_session_features(raw_path: Path) -> dict[str, float]:
+    radar_samples = []
+    link_samples = []
+    for line in raw_path.read_text(encoding="utf-8").splitlines():
+        record = json.loads(line)
+        raw = str(record.get("raw", ""))
+        radar = parse_radar_line(raw)
+        if radar is not None:
+            radar_samples.append(radar)
+        link = parse_link_line(raw)
+        if link is not None:
+            link_samples.append(link)
+    return extract_radar_features(radar_samples, link_samples)
 
 
 def build_dataset_feature_rows(
