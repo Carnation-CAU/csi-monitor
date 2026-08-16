@@ -8,6 +8,8 @@ def main():
     rows=[]
     for path in sorted((HERE/"output").glob("*/summary.json")):
         summary=json.loads(path.read_text(encoding="utf-8")); config=json.loads((path.parent/"config.json").read_text(encoding="utf-8"))
+        if config.get("smoke_test", False):
+            continue
         row={"run":path.parent.name,"model":config["model"],"protocol":config["protocol"],"best_epoch":summary["best_epoch"]}
         row.update({f"val_{k}":v for k,v in summary["validation"].items()})
         row.update({f"test_{k}":v for k,v in summary["test"].items()})
@@ -21,4 +23,3 @@ def main():
     for r in rows: print(f"{r['model']:12s} {r['val_macro_f1']:.4f}       {r['test_macro_f1']:.4f}        {r['test_fall_recall']:.4f}      {r['test_walking_f1']:.4f}")
     print("saved:",target)
 if __name__=="__main__": main()
-
