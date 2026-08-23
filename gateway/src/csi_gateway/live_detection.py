@@ -84,6 +84,12 @@ def format_fall_history_record(record: dict[str, object]) -> str:
         ml_score = evidence.get("ml_fall_score_max")
         if isinstance(ml_score, (int, float)):
             parts.append(f"ML {float(ml_score) * 100:.1f}%")
+        final_score = evidence.get("final_fall_score")
+        if isinstance(final_score, (int, float)):
+            parts.append(f"Soft fusion {float(final_score) * 100:.1f}%")
+        quality = evidence.get("signal_quality_score")
+        if isinstance(quality, (int, float)):
+            parts.append(f"신호 품질 {float(quality) * 100:.0f}%")
 
     status = record.get("status")
     if status:
@@ -119,7 +125,7 @@ class DetectionEvent:
     detected_at: str
     confidence: float
     source: str
-    evidence: dict[str, float | int | bool | str | None]
+    evidence: dict[str, object]
 
     def to_record(self) -> dict[str, object]:
         return asdict(self)
@@ -130,7 +136,7 @@ class ActionPrediction:
     label: str
     confidence: float
     source: str
-    evidence: dict[str, float | int | bool | str | None]
+    evidence: dict[str, object]
 
 
 class WindowClassifier(Protocol):

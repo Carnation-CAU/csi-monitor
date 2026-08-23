@@ -6,7 +6,66 @@ from dataclasses import dataclass, replace
 from uuid import uuid4
 
 from .activity import ActivityPrediction
+from .csi_pipeline import SignalEvidence
 from .live_detection import DetectionEvent
+
+
+DEFAULT_FALL_CANDIDATE_THRESHOLD = 0.10
+DEFAULT_FUSION_DECISION_THRESHOLD = 0.72
+DEFAULT_ML_DIRECT_THRESHOLD = 0.85
+
+
+def recall_first_fusion_score(
+    ml_raw_score: float,
+    *,
+    radar_score: float | None = None,
+    radar_motion_score: float | None = None,
+    signal_rows: list[SignalEvidence] | tuple[SignalEvidence, ...] = (),
+) -> tuple[float, float, dict[str, float], dict[str, float]]:
+    """Return the deployed v3 fusion score and its auditable components.
+
+    CSI motion/impact/post-event rows form one proposal. Radar fall and Radar
+    motion form independent proposals. The strongest correlated proposal is
+    fused with ML so an optional, weaker sensor cannot dilute stronger event
+    evidence.
+    """
+    components = {"ml_raw": ml_raw_score}
+    ml_domain_score = min(1.0, ml_raw_score / 0.35)
+    components["ml_domain_adjusted"] = ml_domain_score
+    proposal_components: dict[str, float] = {}
+    proposal_weights: dict[str, float] = {}
+    proposal_scores: list[float] = []
+    if radar_score is not None:
+        proposal_components["radar"] = radar_score
+        proposal_weights["radar"] = 1.0
+        proposal_scores.append(radar_score)
+    if radar_motion_score is not None:
+        proposal_components["radar_motion"] = radar_motion_score
+        proposal_weights["radar_motion"] = 1.0
+        proposal_scores.append(radar_motion_score)
+    if signal_rows:
+        proposal_components["motion"] = max(row.motion_score for row in signal_rows)
+        proposal_components["impact"] = max(row.impact_score for row in signal_rows)
+        proposal_components["post_event"] = max(
+            row.post_event_score for row in signal_rows
+        )
+        components["signal_quality"] = sum(
+            row.signal_quality_score for row in signal_rows
+        ) / len(signal_rows)
+        proposal_weights.update({"motion": 0.30, "impact": 0.45, "post_event": 0.25})
+        proposal_scores.append(
+            0.30 * proposal_components["motion"]
+            + 0.45 * proposal_components["impact"]
+            + 0.25 * proposal_components["post_event"]
+        )
+    components.update(proposal_components)
+    if proposal_scores:
+        proposal_score = max(proposal_scores)
+        final_score = 0.45 * ml_domain_score + 0.55 * proposal_score
+    else:
+        proposal_score = 0.0
+        final_score = ml_raw_score
+    return final_score, proposal_score, components, proposal_weights
 
 
 @dataclass
@@ -35,7 +94,7 @@ class _FallEpisode:
         self.fall_score_sum += fall_score
         self.window_count += 1
 
-    def evidence(self, threshold: float) -> dict[str, float | int | bool | str]:
+    def evidence(self, threshold: float) -> dict[str, object]:
         return {
             "ml_episode_id": self.episode_id,
             "ml_fall_score_max": self.max_fall_score,
@@ -57,38 +116,99 @@ class _RadarFall:
     consumed: bool = False
 
 
+@dataclass
+class _RadarMotion:
+    proposal_id: str
+    first_observed_at: float
+    last_observed_at: float
+    consumed: bool = False
+
+
 class ActivityEventAggregator:
-    """Treat many overlapping fall windows as one physical action episode."""
+    """Aggregate windows and make a recall-first score decision.
+
+    Radar is optional, but the uncalibrated C3-domain model cannot create a
+    final alert without a real CSI/Radar event proposal. One physical proposal
+    is consumed once and repeated decisions are merged by a refractory window.
+    """
 
     def __init__(
         self,
         *,
-        fall_score_threshold: float = 0.80,
+        fall_score_threshold: float = DEFAULT_FALL_CANDIDATE_THRESHOLD,
+        decision_threshold: float = DEFAULT_FUSION_DECISION_THRESHOLD,
+        ml_direct_threshold: float = DEFAULT_ML_DIRECT_THRESHOLD,
         episode_gap_seconds: float = 2.0,
         radar_correlation_seconds: float = 15.0,
+        final_refractory_seconds: float = 30.0,
         radar_fallback_confidence_threshold: float | None = None,
         radar_fallback_impact_ratio: float = 5.0,
     ) -> None:
         if not 0.0 < fall_score_threshold <= 1.0:
             raise ValueError("fall_score_threshold must be in (0, 1]")
-        if episode_gap_seconds <= 0 or radar_correlation_seconds <= 0:
+        if not 0.0 < decision_threshold <= 1.0:
+            raise ValueError("decision_threshold must be in (0, 1]")
+        if not 0.0 < ml_direct_threshold <= 1.0:
+            raise ValueError("ml_direct_threshold must be in (0, 1]")
+        if (
+            episode_gap_seconds <= 0
+            or radar_correlation_seconds <= 0
+            or final_refractory_seconds <= 0
+        ):
             raise ValueError("episode timing values must be positive")
         if radar_fallback_impact_ratio <= 0:
             raise ValueError("radar_fallback_impact_ratio must be positive")
         self.fall_score_threshold = fall_score_threshold
+        self.decision_threshold = decision_threshold
+        self.ml_direct_threshold = ml_direct_threshold
         self.episode_gap_seconds = episode_gap_seconds
         self.radar_correlation_seconds = radar_correlation_seconds
+        self.final_refractory_seconds = final_refractory_seconds
         self.radar_fallback_impact_ratio = radar_fallback_impact_ratio
         self.radar_fallback_confidence_threshold: float | None = None
         self.set_radar_fallback_threshold(radar_fallback_confidence_threshold)
         self._current: _FallEpisode | None = None
         self._recent: deque[_FallEpisode] = deque(maxlen=8)
         self._recent_radar: deque[_RadarFall] = deque(maxlen=8)
+        self._radar_motion: deque[_RadarMotion] = deque(maxlen=32)
+        # 2,500 samples preserve the full 15 s correlation window even when
+        # the nominal 100 Hz stream temporarily runs substantially faster.
+        self._signal_history: deque[tuple[float, SignalEvidence]] = deque(maxlen=2500)
+        self._consumed_signal_proposals: dict[str, float] = {}
+        self._last_final_at = -float("inf")
 
     def reset(self) -> None:
         self._current = None
         self._recent.clear()
         self._recent_radar.clear()
+        self._radar_motion.clear()
+        self._signal_history.clear()
+        self._consumed_signal_proposals.clear()
+        self._last_final_at = -float("inf")
+
+    def observe_signal(self, evidence: SignalEvidence, *, observed_at: float) -> None:
+        self._signal_history.append((observed_at, evidence))
+        cutoff = observed_at - self.radar_correlation_seconds
+        while self._signal_history and self._signal_history[0][0] < cutoff:
+            self._signal_history.popleft()
+
+    def observe_radar_motion(self, *, moving: bool, observed_at: float) -> None:
+        """Record Radar movement as a proposal, never as an ML inference gate."""
+        if moving:
+            if (
+                self._radar_motion
+                and observed_at - self._radar_motion[-1].last_observed_at <= 1.0
+            ):
+                self._radar_motion[-1].last_observed_at = observed_at
+            else:
+                self._radar_motion.append(
+                    _RadarMotion(
+                        proposal_id=f"radar-motion-{uuid4().hex}",
+                        first_observed_at=observed_at,
+                        last_observed_at=observed_at,
+                    )
+                )
+        self._prune(observed_at)
 
     def set_radar_fallback_threshold(self, threshold: float | None) -> None:
         if threshold is not None and not 0.0 < threshold <= 1.0:
@@ -134,8 +254,9 @@ class ActivityEventAggregator:
             episode = self._finish_current()
             events.append(self._candidate_event(episode))
             radar = self._matching_radar(episode)
-            if radar is not None:
-                events.append(self._fused_event(episode, radar))
+            decision = self._soft_fusion_event(episode, radar)
+            if decision is not None:
+                events.append(decision)
         events.extend(self._radar_fallback_events(observed_at))
         self._prune(observed_at)
         return events
@@ -176,26 +297,158 @@ class ActivityEventAggregator:
         )
         if episode is None:
             return None
-        return self._fused_event(episode, radar)
+        return self._soft_fusion_event(episode, radar)
 
-    def _fused_event(
+    def _soft_fusion_event(
         self,
         episode: _FallEpisode,
-        radar: _RadarFall,
-    ) -> DetectionEvent:
+        radar: _RadarFall | None,
+    ) -> DetectionEvent | None:
+        signal_proposal_id, signal_rows = self._matching_signal_proposal(episode)
+        radar_motion = self._matching_radar_motion(episode)
+        # The deployed checkpoint is C3-domain and severely under-confident on
+        # the available S3 falls. Convert its raw score to evidence strength,
+        # but require independent signal/Radar proposal evidence unless the raw
+        # score reaches the direct-ML threshold.
+        final_score, proposal_score, components, proposal_weights = (
+            recall_first_fusion_score(
+                episode.max_fall_score,
+                radar_score=radar.event.confidence if radar is not None else None,
+                radar_motion_score=1.0 if radar_motion is not None else None,
+                signal_rows=signal_rows,
+            )
+        )
+        has_event_proposal = (
+            radar is not None or radar_motion is not None or bool(signal_rows)
+        )
+        if not has_event_proposal:
+            return None
+        direct_ml = (
+            episode.max_fall_score >= self.ml_direct_threshold
+            and has_event_proposal
+        )
+        if not direct_ml and final_score < self.decision_threshold:
+            return None
+        decision_at = max(
+            episode.last_observed_at,
+            radar.observed_at if radar is not None else episode.last_observed_at,
+        )
+        if decision_at - self._last_final_at < self.final_refractory_seconds:
+            episode.consumed = True
+            if radar is not None:
+                radar.consumed = True
+            if signal_proposal_id is not None:
+                self._consumed_signal_proposals[signal_proposal_id] = decision_at
+            if radar_motion is not None:
+                radar_motion.consumed = True
+            return None
+        quality_score = components.get("signal_quality", 1.0)
+        quality_adjusted_score = final_score * (0.85 + 0.15 * quality_score)
         episode.consumed = True
-        radar.consumed = True
-        evidence = dict(radar.event.evidence)
+        if radar is not None:
+            radar.consumed = True
+        if signal_proposal_id is not None:
+            self._consumed_signal_proposals[signal_proposal_id] = decision_at
+        if radar_motion is not None:
+            radar_motion.consumed = True
+        self._last_final_at = decision_at
+        evidence = dict(radar.event.evidence) if radar is not None else {
+            "presence_state": "unknown",
+            "presence_probability": 0.0,
+            "no_recovery_sec": 0.0,
+        }
         evidence.update(episode.evidence(self.fall_score_threshold))
-        evidence["fusion_rule"] = "ml_and_radar_v1"
+        evidence.update(
+            {
+                "fusion_rule": "recall_first_soft_fusion_v3",
+                "fusion_components": components,
+                "fusion_weights": {
+                    "ml_domain_adjusted": 0.45,
+                    "proposal": 0.55,
+                    **proposal_weights,
+                },
+                "proposal_score": proposal_score,
+                "final_fall_score": final_score,
+                "quality_adjusted_fall_score": quality_adjusted_score,
+                "signal_quality_adjustment_is_not_a_gate": True,
+                "decision_threshold": self.decision_threshold,
+                "ml_direct_threshold": self.ml_direct_threshold,
+                "ml_direct_path": direct_ml,
+                "radar_available": radar is not None,
+                "radar_motion_available": radar_motion is not None,
+                "radar_motion_proposal_id": (
+                    radar_motion.proposal_id if radar_motion is not None else ""
+                ),
+                "event_proposal_required_for_c3_model": True,
+                "signal_proposal_id": signal_proposal_id or "",
+                "signal_proposal_consumed_once": signal_proposal_id is not None,
+                "final_refractory_seconds": self.final_refractory_seconds,
+                "stillness_required": False,
+            }
+        )
+        if signal_rows:
+            best_signal = max(signal_rows, key=lambda row: row.impact_score)
+            evidence.update(best_signal.to_record())
         return DetectionEvent(
-            event_id=radar.event.event_id,
+            event_id=radar.event.event_id if radar is not None else episode.episode_id,
             event_type="fall_suspected",
             label="fall_like",
-            detected_at=radar.event.detected_at,
-            confidence=min(radar.event.confidence, episode.max_fall_score),
-            source="ml_radar_fusion",
+            detected_at=radar.event.detected_at if radar is not None else episode.detected_at,
+            confidence=quality_adjusted_score,
+            source="recall_first_soft_fusion",
             evidence=evidence,
+        )
+
+    def _matching_signal_proposal(
+        self, episode: _FallEpisode
+    ) -> tuple[str | None, list[SignalEvidence]]:
+        groups: dict[str, list[SignalEvidence]] = {}
+        for observed_at, evidence in self._signal_history:
+            proposal_id = evidence.proposal_id
+            baseline_ready_at = observed_at - evidence.baseline_age_seconds
+            proposal_baseline_age = (
+                evidence.proposal_started_at - baseline_ready_at
+                if evidence.proposal_started_at is not None
+                else -float("inf")
+            )
+            if (
+                proposal_id is None
+                or proposal_id in self._consumed_signal_proposals
+                or not evidence.baseline_ready
+                # Do not rescue a startup/channel-change transient merely
+                # because the same long proposal survived for three seconds.
+                # The proposal itself must begin after the baseline has been
+                # stable for the quarantine interval.
+                or proposal_baseline_age < 3.0
+                or abs(observed_at - episode.last_observed_at)
+                > self.radar_correlation_seconds
+            ):
+                continue
+            groups.setdefault(proposal_id, []).append(evidence)
+        if not groups:
+            return None, []
+        proposal_id, rows = max(
+            groups.items(),
+            key=lambda item: recall_first_fusion_score(
+                episode.max_fall_score,
+                signal_rows=item[1],
+            )[1],
+        )
+        return proposal_id, rows
+
+    def _matching_radar_motion(
+        self, episode: _FallEpisode
+    ) -> _RadarMotion | None:
+        return next(
+            (
+                proposal
+                for proposal in reversed(self._radar_motion)
+                if not proposal.consumed
+                and episode.last_observed_at - self.radar_correlation_seconds
+                <= proposal.last_observed_at
+                <= episode.last_observed_at + self.radar_correlation_seconds
+            ),
+            None,
         )
 
     def _matching_radar(self, episode: _FallEpisode) -> _RadarFall | None:
@@ -237,7 +490,11 @@ class ActivityEventAggregator:
                 or impact_ratio < self.radar_fallback_impact_ratio
             ):
                 continue
+            if observed_at - self._last_final_at < self.final_refractory_seconds:
+                radar.consumed = True
+                continue
             radar.consumed = True
+            self._last_final_at = observed_at
             evidence = dict(radar.event.evidence)
             evidence.update(
                 {
@@ -282,6 +539,20 @@ class ActivityEventAggregator:
             and observed_at - self._recent_radar[0].observed_at > radar_retention
         ):
             self._recent_radar.popleft()
+        while (
+            self._radar_motion
+            and observed_at - self._radar_motion[0].last_observed_at
+            > self.radar_correlation_seconds + self.final_refractory_seconds
+        ):
+            self._radar_motion.popleft()
+        proposal_retention = (
+            self.radar_correlation_seconds + self.final_refractory_seconds
+        )
+        self._consumed_signal_proposals = {
+            proposal_id: consumed_at
+            for proposal_id, consumed_at in self._consumed_signal_proposals.items()
+            if observed_at - consumed_at <= proposal_retention
+        }
 
     def _candidate_event(self, episode: _FallEpisode) -> DetectionEvent:
         return DetectionEvent(

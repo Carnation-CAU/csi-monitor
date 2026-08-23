@@ -18,6 +18,8 @@ def select_best_channel(
         valid,
         key=lambda channel: (
             valid[channel]["max_gap"] < 10,
+            valid[channel].get("signal_quality", 0.0),
+            -valid[channel].get("csi_p95_interval_ms", 9999.0),
             valid[channel]["min_hz"],
             valid[channel]["avg_hz"],
             -valid[channel]["max_gap"],
@@ -35,6 +37,8 @@ def render_channel_results(
         rows.append(
             f"CH {channel}: avg {result['avg_hz']:.1f} Hz, "
             f"min {result['min_hz']:.0f} Hz, RSSI {result['avg_rssi']:.1f} dBm, "
-            f"max gap {result['max_gap']:.1f}s"
+            f"max gap {result['max_gap']:.1f}s, "
+            f"CSI {result.get('csi_rate_hz', 0.0):.1f}Hz/"
+            f"quality {result.get('signal_quality', 0.0):.2f}"
         )
     return rows

@@ -4,13 +4,20 @@ import tempfile
 import unittest
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
-from csi_gateway.cli import build_record, create_session_paths, write_json_line
+from csi_gateway.cli import (
+    build_record,
+    create_session_paths,
+    relocate_session_raw,
+    write_json_line,
+)
 from csi_gateway.collection import (
     COLLECTION_LABELS,
     FALL_LABELS,
     TRANSITION_LABELS,
     UNLABELED,
+    add_custom_collection_label,
     finalize_collection_label,
+    load_collection_labels,
     render_korean_summary,
     summarize_collection,
 )
@@ -30,9 +37,11 @@ from csi_gateway.radar import (
     parse_radar_line,
 )
 from csi_gateway.profiles import (
+    FIXED_WIFI_BANDWIDTH,
     append_profile_session,
     archive_profile,
     create_profile,
+    default_workspace_profile,
     list_profiles,
     load_profile,
     load_or_create_profile,
@@ -129,6 +138,30 @@ class CollectorTests(unittest.TestCase):
         self.assertTrue(expected.issubset(COLLECTION_LABELS))
         self.assertTrue(expected.issubset(TRANSITION_LABELS))
 
+    def test_requested_public_actions_are_collection_labels(self):
+        expected = {"walk", "fall", "run", "jump", "squat", "arm_wave", "turn"}
+        self.assertTrue(expected.issubset(COLLECTION_LABELS))
+        self.assertIn("fall", FALL_LABELS)
+
+    def test_custom_collection_label_is_persisted(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            labels = add_custom_collection_label(root, "crawl_slow")
+            self.assertIn("crawl_slow", labels)
+            self.assertIn("crawl_slow", load_collection_labels(root))
+            decision = finalize_collection_label(
+                planned_label="crawl_slow",
+                actual_label="crawl_slow",
+                safety_confirmed=False,
+                available_labels=labels,
+            )
+            self.assertEqual(decision.label, "crawl_slow")
+
+    def test_custom_collection_label_rejects_unsafe_folder_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with self.assertRaises(ValueError):
+                add_custom_collection_label(Path(temp_dir), "../outside")
+
     def test_collection_label_can_be_confirmed_after_collection(self):
         decision = finalize_collection_label(
             planned_label=None,
@@ -181,6 +214,30 @@ class CollectorTests(unittest.TestCase):
             self.assertTrue(raw.parent.is_dir())
             self.assertTrue(manifest.parent.is_dir())
             self.assertEqual(raw.name, "session-1.jsonl")
+
+    def test_labeled_session_path_uses_action_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw, manifest = create_session_paths(root, "session-1", label="walk")
+            self.assertEqual(
+                raw.relative_to(root).as_posix(), "data/raw/walk/session-1.jsonl"
+            )
+            self.assertEqual(
+                manifest.relative_to(root).as_posix(),
+                "data/manifests/session-1.json",
+            )
+
+    def test_completed_session_moves_to_confirmed_action_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            raw, _ = create_session_paths(root, "session-1", label=UNLABELED)
+            raw.write_text("raw", encoding="utf-8")
+            moved = relocate_session_raw(root, raw, "session-1", "run")
+            self.assertEqual(
+                moved.relative_to(root).as_posix(), "data/raw/run/session-1.jsonl"
+            )
+            self.assertEqual(moved.read_text(encoding="utf-8"), "raw")
+            self.assertFalse(raw.exists())
 
     def test_relative_data_path_is_platform_neutral(self):
         self.assertEqual(
@@ -259,6 +316,29 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual(restored["displayName"], "부모님 집 거실")
             self.assertEqual(restored["radio"]["channel"], 6)
             self.assertTrue(restored["needsCalibration"])
+
+    def test_legacy_ht40_profile_is_migrated_and_recalibration_required(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            profile = default_workspace_profile()
+            profile["radio"]["bandwidth"] = "HT40"
+            profile["calibration"] = {"moveThreshold": 0.1}
+            profile["needsCalibration"] = False
+            path = root / "data" / "profiles" / "default-space.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(profile), encoding="utf-8")
+
+            migrated = load_profile(root, "default-space")
+
+            self.assertEqual(
+                migrated["radio"]["bandwidth"], FIXED_WIFI_BANDWIDTH
+            )
+            self.assertIsNone(migrated["calibration"])
+            self.assertTrue(migrated["needsCalibration"])
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8"))["radio"]["bandwidth"],
+                FIXED_WIFI_BANDWIDTH,
+            )
 
     def test_profile_name_edit_preserves_calibration(self):
         with tempfile.TemporaryDirectory() as temp_dir:

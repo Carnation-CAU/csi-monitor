@@ -13,6 +13,7 @@ class ActivityFrame:
     sequence: int
     captured_at: str
     amplitude: np.ndarray
+    device_timestamp_us: int | None = None
 
 @dataclass(frozen=True)
 class ActivityWindow:
@@ -20,6 +21,8 @@ class ActivityWindow:
     first_sequence: int
     last_sequence: int
     finished_at: str
+    resampled: bool = False
+    observed_rate_hz: float | None = None
 
 @dataclass(frozen=True)
 class ActivityPrediction:
@@ -111,12 +114,15 @@ class ActivityPredictionDisplaySmoother:
         self._displayed_label = None
 
 class FrameWindowEngine:
-    """Keep recent frames and call a model at a bounded 10-30 Hz rate."""
-    def __init__(self,model: ActivityModel,window_frames: int=950,inference_hz: float=20.0):
+    """Keep recent frames, time-align them and call a model at a bounded rate."""
+    def __init__(self,model: ActivityModel,window_frames: int=950,inference_hz: float=20.0,target_rate_hz: float=100.0):
         if window_frames<=0: raise ValueError("window_frames must be positive")
         if not 1<=inference_hz<=100: raise ValueError("inference_hz must be between 1 and 100")
-        self.model=model; self.window_frames=window_frames; self.interval=1.0/inference_hz
-        self._frames: list[ActivityFrame]=[]; self._last_inference=-float("inf")
+        if target_rate_hz<=0: raise ValueError("target_rate_hz must be positive")
+        self.model=model; self.window_frames=window_frames; self.interval=1.0/inference_hz; self.target_rate_hz=target_rate_hz
+        # Extra frames preserve enough time coverage when packets arrive above
+        # target rate or short gaps occur.
+        self._frames: deque[ActivityFrame]=deque(maxlen=max(window_frames+32,int(window_frames*1.25))); self._last_inference=-float("inf")
     @property
     def ready(self): return len(self._frames)>=self.window_frames
     @property
@@ -124,12 +130,37 @@ class FrameWindowEngine:
     def append(self,frame: ActivityFrame) -> None:
         x=np.asarray(frame.amplitude,dtype=np.float32)
         if x.shape!=(52,): raise ValueError(f"expected 52 amplitudes, got {x.shape}")
-        self._frames.append(ActivityFrame(frame.sequence,frame.captured_at,x.copy()))
-        if len(self._frames)>self.window_frames: del self._frames[:len(self._frames)-self.window_frames]
+        self._frames.append(ActivityFrame(frame.sequence,frame.captured_at,x.copy(),frame.device_timestamp_us))
     def snapshot(self) -> ActivityWindow:
         if not self.ready: raise RuntimeError(f"need {self.window_frames-len(self._frames)} more frames")
-        frames=self._frames[-self.window_frames:]
-        return ActivityWindow(np.stack([f.amplitude for f in frames]),frames[0].sequence,frames[-1].sequence,frames[-1].captured_at)
+        frames=list(self._frames)
+        timestamped=[f for f in frames if f.device_timestamp_us is not None]
+        if len(timestamped)>=self.window_frames:
+            times=self._unwrap_timestamps(timestamped)
+            duration_us=(self.window_frames-1)*1_000_000.0/self.target_rate_hz
+            target_end=times[-1]; target_start=target_end-duration_us
+            first=int(np.searchsorted(times,target_start,side="right")-1); first=max(0,first)
+            source=timestamped[first:]; source_times=times[first:]
+            if len(source)>=2 and source_times[0]<=target_start:
+                target=np.linspace(target_start,target_end,self.window_frames)
+                values=np.stack([f.amplitude for f in source])
+                aligned=np.empty((self.window_frames,52),dtype=np.float32)
+                for carrier in range(52): aligned[:,carrier]=np.interp(target,source_times,values[:,carrier])
+                intervals=np.diff(source_times)
+                observed_rate=1_000_000.0/float(np.mean(intervals)) if len(intervals) and float(np.mean(intervals))>0 else None
+                return ActivityWindow(aligned,source[0].sequence,source[-1].sequence,source[-1].captured_at,True,observed_rate)
+        selected=frames[-self.window_frames:]
+        return ActivityWindow(np.stack([f.amplitude for f in selected]),selected[0].sequence,selected[-1].sequence,selected[-1].captured_at)
+
+    @staticmethod
+    def _unwrap_timestamps(frames: list[ActivityFrame]) -> np.ndarray:
+        result=[]; offset=0; previous=None
+        for frame in frames:
+            current=int(frame.device_timestamp_us or 0)
+            if previous is not None and current+offset<previous:
+                offset+=2**32
+            value=current+offset; result.append(value); previous=value
+        return np.asarray(result,dtype=np.float64)
     def clear(self) -> None:
         self._frames.clear()
         self._last_inference=-float("inf")
@@ -140,14 +171,16 @@ class FrameWindowEngine:
         return self.model.predict(self.snapshot())
 
 class AsyncFrameWindowEngine:
-    """Run GPU inference away from the serial/UI thread and drop stale requests."""
-    def __init__(self,model: ActivityModel,window_frames: int=950,inference_hz: float=20.0,tail_seconds: float=3.0):
+    """Run inference off-thread; continuous mode prevents a Radar hard gate."""
+    def __init__(self,model: ActivityModel,window_frames: int=950,inference_hz: float=20.0,tail_seconds: float=3.0,continuous_inference: bool=True):
         self.window=FrameWindowEngine(model,window_frames,inference_hz); self._pool=ThreadPoolExecutor(max_workers=1,thread_name_prefix="csi-cnn")
         self._future: Future|None=None; self._result: ActivityPrediction|None=None; self._lock=Lock(); self._last_submit=-float("inf")
-        self._gate=MotionInferenceGate(tail_seconds); self._discard_pending=False
+        self._gate=MotionInferenceGate(tail_seconds); self._discard_pending=False; self.continuous_inference=continuous_inference
     def submit(self,frame: ActivityFrame,*,moving: bool,now: float|None=None) -> None:
         self.window.append(frame); current=monotonic() if now is None else now
-        inference_active=self._gate.update(moving=moving,now=current)
+        # ``moving`` is retained for API compatibility and diagnostics only in
+        # the recall-first default. A missed Radar flag cannot suppress ML.
+        inference_active=self.continuous_inference or self._gate.update(moving=moving,now=current)
         with self._lock:
             if not inference_active or not self.window.ready or self._future is not None or current-self._last_submit<self.window.interval: return
             snapshot=self.window.snapshot(); self._last_submit=current; self._discard_pending=False; self._future=self._pool.submit(self.window.model.predict,snapshot)

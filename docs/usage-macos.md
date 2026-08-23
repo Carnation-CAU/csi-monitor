@@ -79,7 +79,7 @@ ML이 S3 침대 낙상을 놓치는 동안 임시 보조 경보가 필요하면 
   --project-root .
 ```
 
-결과는 `data/raw/<session-id>.jsonl`과
+결과는 `data/raw/empty_room/<session-id>.jsonl`과
 `data/manifests/<session-id>.json`에 생긴다. JSONL에 `CSI_DATA,`가 반복되고
 104개 raw I/Q 정수가 보이는지 확인한다.
 
@@ -94,6 +94,10 @@ ML이 S3 침대 낙상을 놓치는 동안 임시 보조 경보가 필요하면 
 
 TX/RX 모두 ESP32-S3, HT20, 기본 채널 6이며 TX 송신 주기는 10ms(100Hz)다.
 플래시 스크립트는 ESP-IDF 소스나 `third_party/esp-csi` 없이 동작한다.
+
+GUI에서는 초록색 `실제 RF 검증됨`과 `CSI 채널 6`, `RX 응답 6`,
+`Bandwidth HT20 (cwb=0)`, `secondary 0`을 확인한다. 이 표시는 고정 문구가
+아니라 수신 중인 CSI 메타데이터에서 계산되며 CSI가 끊기면 `확인 불가`로 바뀐다.
 
 ## 현재 펌웨어 검증 결과
 

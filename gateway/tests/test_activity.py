@@ -28,11 +28,41 @@ class ActivityTest(unittest.TestCase):
         self.assertIsNone(engine.push(ActivityFrame(4,"4",np.ones(52)*4),moving=True,now=.05))
         result=engine.push(ActivityFrame(5,"5",np.ones(52)*5),moving=True,now=.13)
         self.assertEqual((result.first_sequence,result.last_sequence),(3,5)); self.assertEqual(model.calls,2)
+    def test_timestamp_window_is_resampled_to_fixed_rate(self):
+        model=FakeModel(); engine=FrameWindowEngine(model,window_frames=3,inference_hz=10,target_rate_hz=100)
+        engine.append(ActivityFrame(1,"1",np.zeros(52),0))
+        engine.append(ActivityFrame(2,"2",np.ones(52),10_000))
+        engine.append(ActivityFrame(3,"3",np.ones(52)*3,20_000))
+        window=engine.snapshot()
+        self.assertTrue(window.resampled); self.assertAlmostEqual(window.observed_rate_hz,100.0)
+        self.assertEqual(window.amplitude.shape,(3,52))
+    def test_async_continuous_mode_does_not_require_radar_moving(self):
+        model=FakeModel(); engine=AsyncFrameWindowEngine(model,window_frames=1,inference_hz=10)
+        try:
+            engine.submit(ActivityFrame(1,"1",np.ones(52),0),moving=False,now=0)
+            future=engine._future; self.assertIsNotNone(future); future.result(timeout=1)
+            self.assertIsNotNone(engine.poll()); self.assertEqual(model.calls,1)
+        finally: engine.close()
     def test_csi_parser(self):
-        fields=["CSI_DATA","7","2026-01-01T00:00:00Z","0","x","mac","-55"]+["0"]*12+["6","0","123456"]+["0"]*7
+        fields=["CSI_DATA","7","2026-01-01T00:00:00Z","0","x","1a:00:00:00:00:00","-55"]+["0"]*12+["6","0","123456"]+["0"]*7
+        fields[8]="1"; fields[9]="0"; fields[10]="0"; fields[17]="-98"; fields[27]="104"
         fields.append('"['+','.join(str(i%9-4) for i in range(104))+']"')
         sample=parse_csi_line(','.join(fields))
         self.assertIsNotNone(sample); self.assertEqual(sample.sequence,7); self.assertEqual(sample.amplitude.shape,(52,))
+        self.assertEqual(sample.source_mac,"1a:00:00:00:00:00")
+        self.assertEqual(sample.channel,6); self.assertEqual(sample.bandwidth,"HT20")
+        self.assertEqual(sample.cwb,0); self.assertEqual(sample.secondary_channel,0)
+        self.assertEqual(sample.sig_mode,1)
+        self.assertEqual(sample.iq.shape,(52,2)); self.assertEqual(sample.rate,0)
+        self.assertEqual(int(sample.valid_subcarrier_mask.sum()),48)
+    def test_csi_parser_reports_actual_ht40(self):
+        fields=["CSI_DATA","8","2026-01-01T00:00:01Z","0","x","mac","-60"]+["0"]*12+["11","1","123466"]+["0"]*7
+        fields[8]="1"; fields[9]="0"; fields[10]="1"; fields[17]="-95"; fields[27]="104"
+        fields.append('"['+','.join("1" for _ in range(104))+']"')
+        sample=parse_csi_line(','.join(fields))
+        self.assertIsNotNone(sample)
+        self.assertEqual(sample.channel,11); self.assertEqual(sample.bandwidth,"HT40")
+        self.assertEqual(sample.cwb,1); self.assertEqual(sample.secondary_channel,1)
     def test_motion_gate_keeps_tail_then_stops(self):
         gate=MotionInferenceGate(tail_seconds=2.0)
         self.assertTrue(gate.update(moving=True,now=1.0))

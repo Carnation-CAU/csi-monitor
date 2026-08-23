@@ -7,6 +7,7 @@ from typing import Any
 
 
 DEFAULT_PROFILE_ID = "default-space"
+FIXED_WIFI_BANDWIDTH = "HT20"
 
 
 def utc_now() -> str:
@@ -17,15 +18,44 @@ def profile_path(project_root: Path, profile_id: str) -> Path:
     return project_root / "data" / "profiles" / f"{profile_id}.json"
 
 
+def enforce_fixed_bandwidth(profile: dict[str, Any]) -> bool:
+    """Force the project-wide HT20 invariant on persisted profile metadata.
+
+    A legacy HT40 profile cannot keep its calibration because that calibration's
+    RF conditions are not trustworthy after migration to the fixed HT20 domain.
+    """
+    radio = profile.setdefault("radio", {})
+    previous = radio.get("bandwidth")
+    radio["bandwidth"] = FIXED_WIFI_BANDWIDTH
+    if previous == FIXED_WIFI_BANDWIDTH:
+        return False
+    if previous is not None:
+        profile["calibration"] = None
+        profile["needsCalibration"] = True
+        note = (
+            f"Wi-Fi 대역폭 고정: {previous} → {FIXED_WIFI_BANDWIDTH}, "
+            "빈 공간 보정 다시 필요"
+        )
+        notes = profile.setdefault("notes", [])
+        if note not in notes:
+            notes.append(note)
+    return True
+
+
 def load_profile(project_root: Path, profile_id: str) -> dict[str, Any]:
-    return json.loads(profile_path(project_root, profile_id).read_text(encoding="utf-8"))
+    profile = json.loads(
+        profile_path(project_root, profile_id).read_text(encoding="utf-8")
+    )
+    if enforce_fixed_bandwidth(profile):
+        save_profile(project_root, profile)
+    return profile
 
 
 def list_profiles(project_root: Path) -> list[dict[str, Any]]:
     load_or_create_profile(project_root)
     profiles_dir = project_root / "data" / "profiles"
     profiles = [
-        json.loads(path.read_text(encoding="utf-8"))
+        load_profile(project_root, path.stem)
         for path in profiles_dir.glob("*.json")
     ]
     return sorted(profiles, key=lambda profile: str(profile["displayName"]))
@@ -63,7 +93,11 @@ def create_profile(
             "rxPosition": "사용자가 기록한 위치",
             "antennaGuidance": "보정 당시의 높이와 안테나 방향을 동일하게 복원",
         },
-        "radio": {"channel": channel, "bandwidth": "HT20", "txRateHz": 100},
+        "radio": {
+            "channel": channel,
+            "bandwidth": FIXED_WIFI_BANDWIDTH,
+            "txRateHz": 100,
+        },
         "calibration": None,
         "needsCalibration": True,
         "devices": {
@@ -108,7 +142,11 @@ def default_workspace_profile() -> dict[str, Any]:
             "rxPosition": "",
             "antennaGuidance": "보정 당시의 높이와 안테나 방향을 동일하게 복원",
         },
-        "radio": {"channel": 6, "bandwidth": "HT20", "txRateHz": 100},
+        "radio": {
+            "channel": 6,
+            "bandwidth": FIXED_WIFI_BANDWIDTH,
+            "txRateHz": 100,
+        },
         "calibration": None,
         "needsCalibration": True,
         "devices": {
@@ -126,13 +164,14 @@ def default_workspace_profile() -> dict[str, Any]:
 def load_or_create_profile(project_root: Path) -> dict[str, Any]:
     path = profile_path(project_root, DEFAULT_PROFILE_ID)
     if path.exists():
-        return json.loads(path.read_text(encoding="utf-8"))
+        return load_profile(project_root, DEFAULT_PROFILE_ID)
     profile = default_workspace_profile()
     save_profile(project_root, profile)
     return profile
 
 
 def save_profile(project_root: Path, profile: dict[str, Any]) -> Path:
+    enforce_fixed_bandwidth(profile)
     path = profile_path(project_root, str(profile["profileId"]))
     path.parent.mkdir(parents=True, exist_ok=True)
     profile["updatedAtUtc"] = utc_now()
@@ -150,6 +189,7 @@ def update_profile_channel(
         raise ValueError("channel must be one of 1, 6, or 11")
     previous_channel = profile["radio"].get("channel")
     profile["radio"]["channel"] = channel
+    profile["radio"]["bandwidth"] = FIXED_WIFI_BANDWIDTH
     profile["calibration"] = None
     profile["needsCalibration"] = True
     if previous_channel != channel:
@@ -205,6 +245,7 @@ def update_profile_calibration(
     *,
     someone_threshold: float,
     move_threshold: float,
+    csi_baseline: dict[str, object] | None = None,
 ) -> Path:
     profile["calibration"] = {
         "someoneThreshold": someone_threshold,
@@ -214,8 +255,22 @@ def update_profile_calibration(
         "bufferSize": 5,
         "outliersNumber": 2,
         "calibratedAtUtc": utc_now(),
+        "csiBaseline": csi_baseline,
     }
     profile["needsCalibration"] = False
+    return save_profile(project_root, profile)
+
+
+def update_profile_csi_baseline(
+    project_root: Path,
+    profile: dict[str, Any],
+    csi_baseline: dict[str, object],
+) -> Path | None:
+    """Persist adaptive CSI state without retraining Radar thresholds."""
+    calibration = profile.get("calibration")
+    if not isinstance(calibration, dict):
+        return None
+    calibration["csiBaseline"] = csi_baseline
     return save_profile(project_root, profile)
 
 

@@ -43,6 +43,7 @@ data/profiles/**
 data/datasets/**
 data/exports/**
 data/events/**
+data/collection-labels.json
 !data/raw/.gitkeep
 !data/interim/.gitkeep
 !data/manifests/.gitkeep

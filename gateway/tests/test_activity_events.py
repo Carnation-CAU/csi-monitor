@@ -3,6 +3,7 @@ from dataclasses import replace
 
 from csi_gateway.activity import ActivityPrediction
 from csi_gateway.activity_events import ActivityEventAggregator
+from csi_gateway.csi_pipeline import SignalEvidence
 from csi_gateway.fall_alert import build_detected_fall_event
 from csi_gateway.live_detection import DetectionEvent
 
@@ -48,7 +49,124 @@ def radar_fall(
     )
 
 
+def signal_evidence(
+    observed_at: float,
+    score: float,
+    quality: float = 1.0,
+    proposal_id: str = "proposal-1",
+    baseline_age_seconds: float = 10.0,
+    proposal_started_at: float | None = None,
+) -> SignalEvidence:
+    return SignalEvidence(
+        state="HIGH_ENERGY_EVENT" if score else "IDLE",
+        motion_energy=score,
+        phase_energy=score,
+        motion_score=score,
+        impact_score=score,
+        post_event_score=score,
+        signal_quality_score=quality,
+        baseline_ready=True,
+        baseline_adapted=False,
+        channel_changed=False,
+        observed_at=observed_at,
+        proposal_id=proposal_id if score else None,
+        proposal_started_at=(
+            observed_at if proposal_started_at is None else proposal_started_at
+        )
+        if score
+        else None,
+        proposal_active=bool(score),
+        baseline_age_seconds=baseline_age_seconds,
+    )
+
+
 class ActivityEventAggregatorTests(unittest.TestCase):
+    def test_startup_proposal_tail_stays_quarantined_after_baseline_stabilizes(self):
+        aggregator = ActivityEventAggregator(episode_gap_seconds=1.0)
+        aggregator.observe_signal(
+            signal_evidence(
+                4.0,
+                1.0,
+                baseline_age_seconds=4.0,
+                proposal_started_at=0.0,
+            ),
+            observed_at=4.0,
+        )
+        aggregator.observe(
+            prediction(100, 0.95),
+            observed_at=4.1,
+            detected_at="2026-08-16T00:00:04Z",
+        )
+
+        events = aggregator.expire(5.2)
+
+        self.assertEqual(
+            [event.event_type for event in events],
+            ["ml_fall_candidate"],
+        )
+
+    def test_radar_motion_is_proposal_not_a_required_fall_gate(self):
+        aggregator = ActivityEventAggregator(episode_gap_seconds=1.0)
+        aggregator.observe_radar_motion(moving=True, observed_at=0.0)
+        aggregator.observe_radar_motion(moving=False, observed_at=0.5)
+        aggregator.observe(
+            prediction(100, 0.15),
+            observed_at=1.0,
+            detected_at="2026-08-16T00:00:01Z",
+        )
+
+        events = aggregator.expire(2.1)
+
+        final = [event for event in events if event.event_type == "fall_suspected"]
+        self.assertEqual(len(final), 1)
+        self.assertTrue(final[0].evidence["radar_motion_available"])
+        self.assertFalse(final[0].evidence["radar_available"])
+
+    def test_low_signal_quality_adjusts_confidence_but_never_vetoes(self):
+        aggregator = ActivityEventAggregator(episode_gap_seconds=1.0)
+        aggregator.observe_signal(
+            signal_evidence(0.0, 1.0, quality=0.0), observed_at=0.0
+        )
+        aggregator.observe(
+            prediction(100, 0.15),
+            observed_at=0.1,
+            detected_at="2026-08-16T00:00:00Z",
+        )
+
+        events = aggregator.expire(1.2)
+
+        final = [event for event in events if event.event_type == "fall_suspected"]
+        self.assertEqual(len(final), 1)
+        self.assertLess(
+            final[0].confidence, final[0].evidence["final_fall_score"]
+        )
+        self.assertTrue(
+            final[0].evidence["signal_quality_adjustment_is_not_a_gate"]
+        )
+
+    def test_signal_history_covers_full_fifteen_second_fusion_window(self):
+        aggregator = ActivityEventAggregator()
+        aggregator.observe_signal(signal_evidence(0.0, 1.0), observed_at=0.0)
+        for index in range(1, 1201):
+            at = index / 100.0
+            aggregator.observe_signal(signal_evidence(at, 0.0), observed_at=at)
+            aggregator.expire(at)
+        aggregator.observe(
+            prediction(100, 0.15),
+            observed_at=12.0,
+            detected_at="2026-08-16T00:00:12Z",
+        )
+
+        events = []
+        for index in range(1201, 1402):
+            at = index / 100.0
+            aggregator.observe_signal(signal_evidence(at, 0.0), observed_at=at)
+            events.extend(aggregator.expire(at))
+
+        final = [event for event in events if event.event_type == "fall_suspected"]
+        self.assertEqual(len(final), 1)
+        self.assertGreaterEqual(final[0].evidence["final_fall_score"], 0.72)
+
     def test_overlapping_windows_become_one_candidate(self):
         aggregator = ActivityEventAggregator(
             fall_score_threshold=0.8,
@@ -69,6 +187,78 @@ class ActivityEventAggregatorTests(unittest.TestCase):
         self.assertEqual(events[0].evidence["ml_window_count"], 3)
         self.assertAlmostEqual(events[0].evidence["ml_fall_score_max"], 0.91)
 
+    def test_one_signal_proposal_can_create_only_one_final_fall(self):
+        aggregator = ActivityEventAggregator(episode_gap_seconds=1.0)
+        aggregator.observe_signal(signal_evidence(0.0, 1.0), observed_at=0.0)
+        aggregator.observe(
+            prediction(100, 0.30),
+            observed_at=0.1,
+            detected_at="2026-08-16T00:00:00Z",
+        )
+        first = aggregator.expire(1.2)
+        aggregator.observe(
+            prediction(200, 0.80),
+            observed_at=3.0,
+            detected_at="2026-08-16T00:00:03Z",
+        )
+        repeated = aggregator.expire(4.1)
+
+        self.assertEqual(
+            len([event for event in first if event.event_type == "fall_suspected"]),
+            1,
+        )
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in repeated
+                    if event.event_type == "fall_suspected"
+                ]
+            ),
+            0,
+        )
+
+    def test_final_refractory_period_suppresses_a_second_proposal(self):
+        aggregator = ActivityEventAggregator(
+            episode_gap_seconds=1.0,
+            final_refractory_seconds=30.0,
+        )
+        aggregator.observe_signal(
+            signal_evidence(0.0, 1.0, proposal_id="proposal-1"),
+            observed_at=0.0,
+        )
+        aggregator.observe(
+            prediction(100, 0.30),
+            observed_at=0.1,
+            detected_at="2026-08-16T00:00:00Z",
+        )
+        first = aggregator.expire(1.2)
+        aggregator.observe_signal(
+            signal_evidence(10.0, 1.0, proposal_id="proposal-2"),
+            observed_at=10.0,
+        )
+        aggregator.observe(
+            prediction(200, 0.80),
+            observed_at=10.1,
+            detected_at="2026-08-16T00:00:10Z",
+        )
+        repeated = aggregator.expire(11.2)
+
+        self.assertEqual(
+            len([event for event in first if event.event_type == "fall_suspected"]),
+            1,
+        )
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in repeated
+                    if event.event_type == "fall_suspected"
+                ]
+            ),
+            0,
+        )
+
     def test_radar_event_and_ml_episode_create_one_fused_fall(self):
         aggregator = ActivityEventAggregator(fall_score_threshold=0.8)
         aggregator.observe(
@@ -81,8 +271,8 @@ class ActivityEventAggregatorTests(unittest.TestCase):
         duplicate = aggregator.fuse_radar_fall(radar_fall(), observed_at=9.1)
 
         self.assertIsNotNone(fused)
-        self.assertEqual(fused.source, "ml_radar_fusion")
-        self.assertEqual(fused.evidence["fusion_rule"], "ml_and_radar_v1")
+        self.assertEqual(fused.source, "recall_first_soft_fusion")
+        self.assertEqual(fused.evidence["fusion_rule"], "recall_first_soft_fusion_v3")
         self.assertEqual(fused.evidence["ml_window_count"], 1)
         self.assertIsNone(duplicate)
 
@@ -130,7 +320,7 @@ class ActivityEventAggregatorTests(unittest.TestCase):
             ["ml_fall_candidate", "fall_suspected"],
         )
         self.assertEqual(events[1].event_id, "radar-fall-1")
-        self.assertEqual(events[1].source, "ml_radar_fusion")
+        self.assertEqual(events[1].source, "recall_first_soft_fusion")
 
     def test_radar_before_ml_outside_window_stays_candidate_only(self):
         aggregator = ActivityEventAggregator(
@@ -147,8 +337,7 @@ class ActivityEventAggregatorTests(unittest.TestCase):
 
         events = aggregator.expire(21.1)
 
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0].event_type, "ml_fall_candidate")
+        self.assertEqual([event.event_type for event in events], ["ml_fall_candidate"])
 
     def test_high_confidence_radar_can_fallback_after_ml_wait_window(self):
         aggregator = ActivityEventAggregator(

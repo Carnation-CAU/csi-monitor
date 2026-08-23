@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import fmean
 
 from .radar import LinkSample, RadarSample
 
 
 COLLECTION_LABELS = [
+    "walk",
+    "fall",
+    "run",
+    "jump",
+    "squat",
+    "arm_wave",
+    "turn",
     "empty_room",
     "standing_static",
     "walking_slow",
@@ -19,14 +29,71 @@ COLLECTION_LABELS = [
     "fall_simulated_mattress",
 ]
 TRANSITION_LABELS = {
+    "fall",
+    "jump",
+    "squat",
+    "turn",
     "lie_down_slow",
     "get_up_from_bed",
     "sit_down_fast",
     "pick_up_object",
     "fall_simulated_mattress",
 }
-FALL_LABELS = {"fall_simulated_mattress"}
+FALL_LABELS = {"fall", "fall_simulated_mattress"}
 UNLABELED = "unlabeled"
+LABEL_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+CUSTOM_LABELS_FILE = Path("data") / "collection-labels.json"
+
+
+def is_valid_collection_label(label: object) -> bool:
+    """Return whether a label is safe for metadata and a raw-data folder name."""
+    return isinstance(label, str) and LABEL_PATTERN.fullmatch(label) is not None
+
+
+def load_collection_labels(project_root: Path) -> list[str]:
+    """Load built-in labels followed by locally configured custom labels."""
+    labels = list(COLLECTION_LABELS)
+    path = project_root / CUSTOM_LABELS_FILE
+    if not path.is_file():
+        return labels
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return labels
+    custom_labels = payload.get("labels", []) if isinstance(payload, dict) else []
+    if not isinstance(custom_labels, list):
+        return labels
+    for label in custom_labels:
+        if is_valid_collection_label(label) and label not in labels:
+            labels.append(label)
+    return labels
+
+
+def add_custom_collection_label(project_root: Path, label: str) -> list[str]:
+    """Persist one custom label and return the complete collection-label list."""
+    normalized = label.strip().lower()
+    if not is_valid_collection_label(normalized) or normalized == UNLABELED:
+        raise ValueError(
+            "행동 라벨은 영문 소문자로 시작하고 영문 소문자, 숫자, 밑줄만 "
+            "사용해 64자 이내로 입력하세요."
+        )
+    labels = load_collection_labels(project_root)
+    if normalized in labels:
+        return labels
+    custom_labels = [item for item in labels if item not in COLLECTION_LABELS]
+    custom_labels.append(normalized)
+    path = project_root / CUSTOM_LABELS_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {"schemaVersion": "1.0.0", "labels": custom_labels},
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return load_collection_labels(project_root)
 
 
 @dataclass(frozen=True)
@@ -42,9 +109,11 @@ def finalize_collection_label(
     planned_label: str | None,
     actual_label: str | None,
     safety_confirmed: bool,
+    available_labels: list[str] | None = None,
 ) -> CollectionLabelDecision:
     """수집 종료 후 실제 행동 라벨과 유효성 정책을 결정한다."""
-    if planned_label is not None and planned_label not in COLLECTION_LABELS:
+    labels = available_labels if available_labels is not None else COLLECTION_LABELS
+    if planned_label is not None and planned_label not in labels:
         raise ValueError(f"지원하지 않는 예정 라벨: {planned_label}")
     if actual_label is None:
         return CollectionLabelDecision(
@@ -53,7 +122,7 @@ def finalize_collection_label(
             corrected=False,
             invalid_reason="실제 행동 라벨 미확정",
         )
-    if actual_label not in COLLECTION_LABELS:
+    if actual_label not in labels:
         raise ValueError(f"지원하지 않는 실제 라벨: {actual_label}")
 
     invalid_reason = None

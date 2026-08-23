@@ -19,7 +19,9 @@ ESP32-S3 송신기 → ESP32-S3 CSI 수신기 → PC 수집기
 - 종료 후 실제 행동을 확정하는 안내형 수집과 특징 CSV 생성
 - 평상시 움직임·정지 전이와 낙상 의심 이벤트의 날짜별 자동 기록
 - `v_main` PyTorch 모델의 Windows/macOS 로컬 행동 추론과 겹치는 window 사건 집계
-- ML 낙상 후보와 충격 후 8초간 무회복 Radar 근거가 일치할 때 앱 서버로 이벤트 전송
+- 연속 ML 추론과 CSI/Radar event proposal을 hard AND 없이 결합하는 Recall 우선 soft fusion
+- raw IQ·phase·RF metadata 보존, timestamp resampling, 적응형 공간 baseline과 packet 품질 진단
+- 낙상 후보 전후 5초 원시 clip, 동일 세션 event-level 전후 replay와 S3 grouped 학습 pipeline
 - ESP-IDF 없이 업로드 가능한 완성 펌웨어 (`firmware/prebuilt`)
 - Espressif `esp-csi` 고정 커밋과 프로젝트 패치
 
@@ -41,6 +43,7 @@ Python은 3.10 이상이면 동작한다. 펌웨어를 직접 빌드할 때만 3
 [macOS 사용법](docs/usage-macos.md), [Windows 사용법](docs/usage-windows.md),
 [공통 사용법](docs/usage.md),
 [실험 규약](docs/experiment-protocol.md), [ML 학습·시스템 적용 계획](docs/ml-system-integration-plan.md),
+[S3 Recall-first 재설계·검증](docs/s3-recall-first-architecture.md),
 [성장 및 추가 개발 로드맵](docs/growth-roadmap.md)을 참고한다.
 
 ## 펌웨어

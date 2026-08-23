@@ -12,13 +12,21 @@ from time import monotonic
 from uuid import uuid4
 
 from .calibration import render_channel_results, select_best_channel
-from .cli import build_record, create_session_paths, utc_now, write_json_line
+from .cli import (
+    SCHEMA_VERSION,
+    build_record,
+    create_session_paths,
+    relocate_session_raw,
+    utc_now,
+    write_json_line,
+)
 from .collection import (
-    COLLECTION_LABELS,
     FALL_LABELS,
     TRANSITION_LABELS,
     UNLABELED,
+    add_custom_collection_label,
     finalize_collection_label,
+    load_collection_labels,
     render_korean_summary,
     summarize_collection,
 )
@@ -56,6 +64,7 @@ from .presence import (
     build_static_presence_baseline,
 )
 from .profiles import (
+    FIXED_WIFI_BANDWIDTH,
     append_profile_session,
     archive_profile,
     create_profile,
@@ -63,6 +72,7 @@ from .profiles import (
     load_profile,
     load_or_create_profile,
     update_profile_calibration,
+    update_profile_csi_baseline,
     update_profile_channel,
     update_profile_details,
     update_profile_rx_mac,
@@ -87,7 +97,13 @@ from .activity import (
     AsyncFrameWindowEngine,
 )
 from .activity_events import ActivityEventAggregator
-from .csi import RAW_CSI_ENABLE_COMMAND, parse_csi_line
+from .csi import CsiFrameSample, RAW_CSI_ENABLE_COMMAND, parse_csi_line
+from .csi_pipeline import (
+    AdaptiveCsiBaseline,
+    CsiRealtimePipeline,
+    PacketTimingTracker,
+)
+from .event_clips import EventClipRecorder
 
 def run_monitor(
     port: str,
@@ -98,7 +114,9 @@ def run_monitor(
     activity_hz: float = 5.0,
     activity_window_frames: int | None = None,
     activity_tail_seconds: float = 3.0,
-    activity_fall_threshold: float = 0.80,
+    activity_fall_threshold: float = 0.10,
+    fusion_decision_threshold: float = 0.72,
+    ml_direct_threshold: float = 0.85,
 ) -> int:
     import pyqtgraph as pg
     from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
@@ -203,6 +221,17 @@ def run_monitor(
             self.setMinimumSize(1000, 700)
             self.project_root = Path(project_root).resolve()
             self.active_profile = load_or_create_profile(self.project_root)
+            calibration = self.active_profile.get("calibration") or {}
+            baseline_record = (
+                calibration.get("csiBaseline")
+                if isinstance(calibration, dict)
+                else None
+            )
+            self.csi_pipeline = CsiRealtimePipeline(
+                AdaptiveCsiBaseline.from_record(baseline_record)
+            )
+            self.event_clip_recorder = EventClipRecorder(self.project_root)
+            self.latest_signal_evidence = None
             self.presence_detector = PresenceDetector()
             self.refresh_presence_baseline()
             self.event_journal = EventJournal(self.project_root)
@@ -229,6 +258,13 @@ def run_monitor(
             self.activity_model_device = ""
             self.csi_frame_count = 0
             self.last_csi_at = 0.0
+            self.reported_rx_channel: int | None = None
+            self.observed_csi_channel: int | None = None
+            self.observed_bandwidth: str | None = None
+            self.observed_cwb: int | None = None
+            self.observed_secondary_channel: int | None = None
+            self.observed_sig_mode: int | None = None
+            self.observed_source_mac: str | None = None
             self.activity_display = ActivityPredictionDisplaySmoother(
                 history_size=5,
                 refresh_seconds=1.0,
@@ -259,6 +295,8 @@ def run_monitor(
                     )
                     self.activity_aggregator = ActivityEventAggregator(
                         fall_score_threshold=activity_fall_threshold,
+                        decision_threshold=fusion_decision_threshold,
+                        ml_direct_threshold=ml_direct_threshold,
                     )
                 except Exception as exc:
                     self.activity_model_error = str(exc)
@@ -277,6 +315,7 @@ def run_monitor(
             self.scan_link_samples: list[LinkSample] = []
             self.scan_radar_times: list[float] = []
             self.scan_results: dict[int, dict[str, float]] = {}
+            self.scan_csi_timing: dict[int, PacketTimingTracker] = {}
             self.scan_measure_started = 0.0
             self.collecting = False
             self.collection_phase = ""
@@ -293,6 +332,7 @@ def run_monitor(
             self.collection_sample_id = 0
             self.collection_radar_samples: list[RadarSample] = []
             self.collection_link_samples: list[LinkSample] = []
+            self.collection_radio_issues: list[str] = []
             self.collection_safety_confirmed: bool | None = None
             self.fall_alert_workers: list[FallAlertWorker] = []
             self.pending_fall_alerts: dict[str, dict[str, object]] = {}
@@ -344,7 +384,7 @@ def run_monitor(
                 "background:#eef2f6;color:#344054;padding:8px;border-radius:5px;"
             )
             self.fusion_diagnostic_status = QLabel(
-                "융합 진단: ML과 Radar 낙상 후보 대기"
+                "융합 진단: 연속 ML·CSI/Radar proposal soft fusion 대기"
             )
             self.fusion_diagnostic_status.setWordWrap(True)
             self.fusion_diagnostic_status.setStyleSheet(
@@ -353,7 +393,7 @@ def run_monitor(
             self.fall_sound_checkbox = QCheckBox("낙상 후보·최종 감지 소리")
             self.fall_sound_checkbox.setChecked(True)
             self.fall_sound_checkbox.setToolTip(
-                "낙상 후보는 1회, ML+Radar 최종 낙상 의심은 3회 울립니다."
+                "낙상 후보는 1회, soft-fusion 최종 낙상 의심은 3회 울립니다."
             )
             self.radar_fallback_checkbox = QCheckBox(
                 "실험적 Radar 단독 보조 알림"
@@ -496,12 +536,23 @@ def run_monitor(
             dataset_group.setLayout(dataset_layout)
             self.refresh_dataset_list()
 
+            self.collection_labels = load_collection_labels(self.project_root)
             self.collection_label_combo = QComboBox()
             self.collection_label_combo.addItem("수집 후 실제 행동 선택", None)
-            for collection_label in COLLECTION_LABELS:
+            for collection_label in self.collection_labels:
                 self.collection_label_combo.addItem(collection_label, collection_label)
             self.collection_label_combo.currentTextChanged.connect(
                 self.update_collection_cue_default
+            )
+            self.collection_label_add_button = QPushButton("행동 추가")
+            self.collection_label_add_button.clicked.connect(
+                self.add_collection_label_dialog
+            )
+            self.collection_person_id = QLineEdit()
+            self.collection_person_id.setPlaceholderText("person-01 (필수, 익명 ID)")
+            self.collection_position_id = QLineEdit()
+            self.collection_position_id.setPlaceholderText(
+                "center / near-tx / corner (필수)"
             )
 
             self.collection_prep_spin = QSpinBox()
@@ -560,6 +611,7 @@ def run_monitor(
 
             collection_primary_controls = QHBoxLayout()
             collection_primary_controls.addWidget(self.collection_label_combo, 1)
+            collection_primary_controls.addWidget(self.collection_label_add_button)
             collection_primary_controls.addWidget(self.collection_prep_spin)
             collection_primary_controls.addWidget(self.collection_duration_spin)
             collection_primary_controls.addWidget(self.collection_start_button)
@@ -568,9 +620,15 @@ def run_monitor(
             collection_option_controls.addWidget(self.collection_cue_spin)
             collection_option_controls.addWidget(self.collection_fall_safety_checkbox)
             collection_option_controls.addStretch(1)
+            collection_metadata_controls = QHBoxLayout()
+            collection_metadata_controls.addWidget(QLabel("사람 ID"))
+            collection_metadata_controls.addWidget(self.collection_person_id, 1)
+            collection_metadata_controls.addWidget(QLabel("위치 ID"))
+            collection_metadata_controls.addWidget(self.collection_position_id, 1)
             collection_layout = QVBoxLayout()
             collection_layout.addLayout(collection_primary_controls)
             collection_layout.addLayout(collection_option_controls)
+            collection_layout.addLayout(collection_metadata_controls)
             fall_alert_layout = QHBoxLayout()
             fall_alert_layout.addWidget(QLabel("낙상 알림 서버"))
             fall_alert_layout.addWidget(self.fall_alert_endpoint, 1)
@@ -747,7 +805,8 @@ def run_monitor(
             container.setLayout(layout)
             self.setCentralWidget(container)
 
-            self.reader = SerialReader(enable_raw_csi=self.activity_engine is not None)
+            # RF 상태는 모델 유무와 관계없이 live CSI 메타데이터로 확인한다.
+            self.reader = SerialReader(enable_raw_csi=True)
             self.reader.sample_received.connect(self.update_sample)
             self.reader.link_received.connect(self.update_link)
             self.reader.channel_received.connect(self.update_channel)
@@ -796,7 +855,8 @@ def run_monitor(
                 else "정지 재실 기준 미구성"
             )
             self.profile_status.setText(
-                f"저장 채널 {channel}  |  {calibration}  |  "
+                f"저장 채널 {channel}  |  {FIXED_WIFI_BANDWIDTH} 고정  |  "
+                f"{calibration}  |  "
                 f"연결 데이터 {len(self.active_profile.get('sessionIds', []))}개  |  "
                 f"참조 데이터셋 {len(self.active_profile.get('referenceDatasets', []))}개  |  "
                 f"{static_presence}"
@@ -811,6 +871,18 @@ def run_monitor(
             )
             if hasattr(self, "live_detector"):
                 self.live_detector = self.build_live_detector()
+
+        def reload_csi_baseline(self) -> None:
+            calibration = self.active_profile.get("calibration") or {}
+            record = (
+                calibration.get("csiBaseline")
+                if isinstance(calibration, dict)
+                else None
+            )
+            self.csi_pipeline = CsiRealtimePipeline(
+                AdaptiveCsiBaseline.from_record(record)
+            )
+            self.latest_signal_evidence = None
 
         def build_live_detector(self) -> LiveActionDetector:
             # Radar 규칙은 ML과 독립적으로 계속 동작한다. model.pt가 활성화된
@@ -838,6 +910,7 @@ def run_monitor(
             if not profile_id:
                 return
             self.active_profile = load_profile(self.project_root, profile_id)
+            self.reload_csi_baseline()
             self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("profile_changed"))
             self.refresh_profile_status()
@@ -1026,6 +1099,7 @@ def run_monitor(
                 distance_meters=distance,
                 channel=channel,
             )
+            self.reload_csi_baseline()
             self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("calibration_required"))
             self.refresh_profile_list(self.active_profile["profileId"])
@@ -1067,6 +1141,7 @@ def run_monitor(
             )
             remaining_profiles = list_profiles(self.project_root)
             self.active_profile = remaining_profiles[0]
+            self.reload_csi_baseline()
             self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("profile_changed"))
             self.refresh_profile_list(self.active_profile["profileId"])
@@ -1313,6 +1388,29 @@ def run_monitor(
             self.collection_cue_checkbox.setChecked(label in TRANSITION_LABELS)
             self.collection_fall_safety_checkbox.setChecked(label in FALL_LABELS)
 
+        def add_collection_label_dialog(self) -> None:
+            label, accepted = QInputDialog.getText(
+                self,
+                "행동 추가",
+                "새 행동 라벨을 입력하세요.\n"
+                "영문 소문자, 숫자, 밑줄만 사용할 수 있습니다. 예: crawl_slow",
+            )
+            if not accepted:
+                return
+            try:
+                self.collection_labels = add_custom_collection_label(
+                    self.project_root, label
+                )
+            except ValueError as exc:
+                QMessageBox.warning(self, "행동 라벨 오류", str(exc))
+                return
+            normalized = label.strip().lower()
+            existing_index = self.collection_label_combo.findData(normalized)
+            if existing_index < 0:
+                self.collection_label_combo.addItem(normalized, normalized)
+                existing_index = self.collection_label_combo.findData(normalized)
+            self.collection_label_combo.setCurrentIndex(existing_index)
+
         def update_collection_cue_limit(self, duration: int) -> None:
             self.collection_cue_spin.setMaximum(max(1, duration - 1))
             if self.collection_cue_spin.value() >= duration:
@@ -1320,6 +1418,9 @@ def run_monitor(
 
         def set_collection_controls_enabled(self, enabled: bool) -> None:
             self.collection_label_combo.setEnabled(enabled)
+            self.collection_label_add_button.setEnabled(enabled)
+            self.collection_person_id.setEnabled(enabled)
+            self.collection_position_id.setEnabled(enabled)
             self.collection_prep_spin.setEnabled(enabled)
             self.collection_duration_spin.setEnabled(enabled)
             self.collection_cue_checkbox.setEnabled(enabled)
@@ -1351,8 +1452,28 @@ def run_monitor(
             if self.calibrating or self.scanning_channels or self.collecting:
                 return
 
+            radio_issues = self.runtime_radio_issues()
+            if radio_issues:
+                QMessageBox.warning(
+                    self,
+                    "실제 RF 상태 확인 필요",
+                    "행동 수집은 실제 TX/RX 링크가 채널·HT20 조건을 만족할 때만 "
+                    "시작할 수 있습니다.\n\n- " + "\n- ".join(radio_issues),
+                )
+                self.refresh_radio_status()
+                return
+
             planned_label = self.collection_label_combo.currentData()
             display_label = planned_label or "수집 후 실제 행동 선택"
+            person_id = self.collection_person_id.text().strip()
+            position_id = self.collection_position_id.text().strip()
+            if not person_id or not position_id:
+                QMessageBox.warning(
+                    self,
+                    "수집 metadata 필요",
+                    "사람 ID와 위치 ID를 모두 입력하세요. 실제 이름 대신 person-01 같은 익명 ID를 사용합니다.",
+                )
+                return
             duration = self.collection_duration_spin.value()
             cue_enabled = self.collection_cue_checkbox.isChecked()
             cue_offset = self.collection_cue_spin.value()
@@ -1381,7 +1502,8 @@ def run_monitor(
             reply = QMessageBox.question(
                 self,
                 "행동 데이터 수집",
-                f"예정 행동: {display_label}\n준비: {self.collection_prep_spin.value()}초\n"
+                f"예정 행동: {display_label}\n사람: {person_id} · 위치: {position_id}\n"
+                f"준비: {self.collection_prep_spin.value()}초\n"
                 f"수집: {duration}초\n\n수집을 시작할까요?",
                 QMessageBox.Yes | QMessageBox.Cancel,
                 QMessageBox.Yes,
@@ -1397,7 +1519,9 @@ def run_monitor(
             self.collection_cue_offset = cue_offset
             self.collection_event_at = None
             self.collection_planned_label = planned_label
-            self.collection_label = UNLABELED
+            self.collection_person = person_id
+            self.collection_position = position_id
+            self.collection_label = planned_label or UNLABELED
             self.collection_session_id = (
                 datetime.now().strftime("%Y%m%d-%H%M%S") + "-collection"
             )
@@ -1412,8 +1536,28 @@ def run_monitor(
             self.collection_timer.start()
 
         def begin_collection(self) -> None:
+            radio_issues = self.runtime_radio_issues()
+            if radio_issues:
+                self.collection_timer.stop()
+                self.collecting = False
+                self.collection_phase = ""
+                self.set_collection_controls_enabled(True)
+                self.collection_status.setText("수집 취소: 실제 RF 상태 불일치")
+                self.status.setText("COLLECTION CANCELLED - RF MISMATCH")
+                self.status.setStyleSheet(
+                    "background:#b42318;color:white;padding:18px;border-radius:8px;"
+                )
+                QMessageBox.warning(
+                    self,
+                    "수집 시작 전 RF 상태 변경 감지",
+                    "준비 시간 중 실제 RF 상태가 바뀌어 수집을 취소했습니다.\n\n- "
+                    + "\n- ".join(radio_issues),
+                )
+                return
             raw_path, manifest_path = create_session_paths(
-                self.project_root, self.collection_session_id
+                self.project_root,
+                self.collection_session_id,
+                label=self.collection_planned_label or UNLABELED,
             )
             self.collection_raw_path = raw_path
             self.collection_manifest_path = manifest_path
@@ -1423,15 +1567,20 @@ def run_monitor(
             self.collection_remaining = self.collection_duration
             self.collection_radar_samples.clear()
             self.collection_link_samples.clear()
+            self.collection_radio_issues.clear()
             started_at = utc_now()
             self.collection_manifest = {
-                "schemaVersion": "1.0.0",
+                "schemaVersion": SCHEMA_VERSION,
                 "sessionId": self.collection_session_id,
                 "startedAtUtc": started_at,
                 "finishedAtUtc": None,
                 "deviceId": "rx-s3-001",
                 "profileId": self.active_profile["profileId"],
                 "roomId": self.active_profile["roomId"],
+                "personId": self.collection_person,
+                "positionId": self.collection_position,
+                "activityId": self.collection_planned_label,
+                "deviceFamily": "ESP32-S3",
                 "plannedLabel": self.collection_planned_label,
                 "label": UNLABELED,
                 "labelConfirmedAtEnd": False,
@@ -1449,7 +1598,22 @@ def run_monitor(
                 ),
                 "eventAtUtc": None,
                 "safetyProtocolConfirmed": self.collection_safety_confirmed,
-                "channel": self.current_channel,
+                "channel": self.observed_csi_channel,
+                "bandwidth": self.observed_bandwidth,
+                "configuredBandwidth": FIXED_WIFI_BANDWIDTH,
+                "radioObservation": {
+                    "rxReportedChannel": self.reported_rx_channel,
+                    "csiChannel": self.observed_csi_channel,
+                    "bandwidth": self.observed_bandwidth,
+                    "cwb": self.observed_cwb,
+                    "secondaryChannel": self.observed_secondary_channel,
+                    "sigMode": self.observed_sig_mode,
+                    "sourceMac": self.observed_source_mac,
+                },
+                "radioIssuesDuringCollection": [],
+                "preprocessingVersion": "s3-relative-csi-v1",
+                "csiBaseline": self.csi_pipeline.baseline.to_record(),
+                "csiTimingAtStart": self.csi_pipeline.timing.stats().to_record(),
                 "valid": None,
                 "rawFile": raw_path.relative_to(self.project_root).as_posix(),
             }
@@ -1480,6 +1644,10 @@ def run_monitor(
 
             if self.collection_phase != "recording":
                 return
+
+            for issue in self.runtime_radio_issues():
+                if issue not in self.collection_radio_issues:
+                    self.collection_radio_issues.append(issue)
 
             self.collection_elapsed += 1
             self.collection_remaining -= 1
@@ -1528,13 +1696,34 @@ def run_monitor(
             )
 
         def process_activity_frame(self, raw_line: bytes) -> None:
-            if self.activity_engine is None:
-                return
             sample = parse_csi_line(raw_line)
             if sample is None:
                 return
+            now = monotonic()
             self.csi_frame_count += 1
-            self.last_csi_at = monotonic()
+            self.last_csi_at = now
+            self.observe_csi_radio(sample)
+            self.event_clip_recorder.observe(
+                raw_line=raw_line,
+                observed_at=now,
+                timestamp_utc=utc_now(),
+            )
+            if self.calibrating and self.calibration_stage == "training":
+                self.csi_pipeline.baseline.observe_calibration(sample)
+            evidence = self.csi_pipeline.observe(sample, observed_at=now)
+            if self.scanning_channels and self.scan_phase == "measuring":
+                self.scan_csi_timing.setdefault(
+                    sample.channel, PacketTimingTracker()
+                ).observe(sample)
+            self.latest_signal_evidence = evidence
+            if self.activity_aggregator is not None:
+                self.activity_aggregator.observe_signal(evidence, observed_at=now)
+            if self.collection_phase == "recording":
+                for issue in self.runtime_radio_issues():
+                    if issue not in self.collection_radio_issues:
+                        self.collection_radio_issues.append(issue)
+            if self.activity_engine is None:
+                return
             suspended = self.scanning_channels or self.calibrating or self.collecting
             if suspended:
                 self.activity_engine.deactivate(clear_frames=True)
@@ -1551,8 +1740,14 @@ def run_monitor(
                     )
                 return
             self.activity_engine.submit(
-                ActivityFrame(sample.sequence, sample.timestamp, sample.amplitude),
+                ActivityFrame(
+                    sample.sequence,
+                    sample.timestamp,
+                    sample.amplitude,
+                    sample.local_timestamp_us,
+                ),
                 moving=self.current_moving and not suspended,
+                now=now,
             )
 
         def poll_activity_prediction(self) -> None:
@@ -1610,7 +1805,7 @@ def run_monitor(
                         self.has_activity_prediction = False
                         self.last_timeline_ml_label = None
                     self.activity_status.setText(
-                        "행동 분류: 모델 준비됨 · Radar 움직임 대기"
+                        "행동 분류: 모델 준비됨 · 연속 CSI 추론 중"
                     )
                     self.activity_status.setStyleSheet(
                         "background:#087f3d;color:white;padding:10px;border-radius:6px;"
@@ -1633,10 +1828,16 @@ def run_monitor(
                 for name, value in averaged_scores.items()
             )
             self.has_activity_prediction = True
+            display_label = {
+                "fall_suspected": "낙상성 패턴(참고 · 최종 경보 아님)",
+                "walking": "보행 패턴",
+                "other_motion": "기타 움직임 패턴",
+            }.get(label, label)
             self.activity_status.setText(
-                f"행동 분류(실험 ML · 최근 5회 평균 · 5초 유지): {label} · {scores}"
+                "행동 분류(실험 C3 모델 · 최근 5회 평균 · 5초 유지): "
+                f"{display_label} · {scores}"
             )
-            color = "#b42318" if label == "fall_suspected" else "#175cd3"
+            color = "#b54708" if label == "fall_suspected" else "#175cd3"
             self.activity_status.setStyleSheet(
                 f"background:{color};color:white;padding:10px;border-radius:6px;"
             )
@@ -1659,15 +1860,15 @@ def run_monitor(
                 QTimer.singleShot(180, lambda: QApplication.beep())
                 QTimer.singleShot(360, lambda: QApplication.beep())
                 default_index = 0
-                if self.collection_planned_label in COLLECTION_LABELS:
-                    default_index = COLLECTION_LABELS.index(
+                if self.collection_planned_label in self.collection_labels:
+                    default_index = self.collection_labels.index(
                         self.collection_planned_label
                     )
                 actual_label, label_confirmed = QInputDialog.getItem(
                     self,
                     "실제 행동 확인",
                     "방금 실제로 수행한 행동을 선택하세요.",
-                    COLLECTION_LABELS,
+                    self.collection_labels,
                     default_index,
                     False,
                 )
@@ -1675,11 +1876,13 @@ def run_monitor(
                     planned_label=self.collection_planned_label,
                     actual_label=actual_label if label_confirmed else None,
                     safety_confirmed=self.collection_safety_confirmed is True,
+                    available_labels=self.collection_labels,
                 )
                 self.collection_label = decision.label
                 self.collection_manifest.update(
                     {
                         "label": decision.label,
+                        "activityId": decision.label,
                         "labelConfirmedAtEnd": decision.confirmed,
                         "labelCorrected": decision.corrected,
                     }
@@ -1694,6 +1897,19 @@ def run_monitor(
                             f"{decision.invalid_reason}\n\n"
                             "원본은 보존하지만 학습·내보내기에서는 제외합니다.",
                         )
+                elif self.collection_radio_issues:
+                    valid = False
+                    invalid_reason = (
+                        "수집 중 실제 RF 조건 불일치: "
+                        + "; ".join(self.collection_radio_issues)
+                    )
+                    if show_dialog:
+                        QMessageBox.warning(
+                            self,
+                            "수집 데이터 자동 제외",
+                            f"{invalid_reason}\n\n"
+                            "원본은 보존하지만 학습·내보내기에서는 제외합니다.",
+                        )
                 else:
                     reply = QMessageBox.question(
                         self,
@@ -1705,6 +1921,26 @@ def run_monitor(
                     valid = reply == QMessageBox.Yes
                     if not valid:
                         invalid_reason = "사용자가 수집 후 무효로 표시"
+            else:
+                self.collection_label = UNLABELED
+                self.collection_manifest.update(
+                    {
+                        "label": UNLABELED,
+                        "labelConfirmedAtEnd": False,
+                        "labelCorrected": False,
+                    }
+                )
+
+            assert self.collection_raw_path is not None
+            self.collection_raw_path = relocate_session_raw(
+                self.project_root,
+                self.collection_raw_path,
+                self.collection_session_id,
+                self.collection_label,
+            )
+            self.collection_manifest["rawFile"] = self.collection_raw_path.relative_to(
+                self.project_root
+            ).as_posix()
 
             summary = summarize_collection(
                 self.collection_radar_samples, self.collection_link_samples
@@ -1714,6 +1950,9 @@ def run_monitor(
                     "finishedAtUtc": utc_now(),
                     "sampleCount": self.collection_sample_id,
                     "eventAtUtc": self.collection_event_at,
+                    "radioIssuesDuringCollection": self.collection_radio_issues,
+                    "csiTiming": self.csi_pipeline.timing.stats().to_record(),
+                    "csiBaseline": self.csi_pipeline.baseline.to_record(),
                     "valid": valid,
                     "invalidReason": invalid_reason,
                     "summary": {
@@ -1911,6 +2150,8 @@ def run_monitor(
             self,
             *,
             marker_at: float,
+            event_id: str,
+            event_type: str,
             label: str,
             color: str,
             symbol: str,
@@ -1934,6 +2175,8 @@ def run_monitor(
             self.detection_timeline_events.append(
                 {
                     "marker_at": marker_at,
+                    "event_id": event_id,
+                    "event_type": event_type,
                     "label": label,
                     "color": color,
                     "symbol": symbol,
@@ -1945,6 +2188,15 @@ def run_monitor(
                 removed = self.detection_timeline_events.pop(0)
                 self.plot.removeItem(removed["text_item"])
             self.refresh_detection_timeline()
+
+        def remove_detection_timeline_markers(self, predicate) -> None:
+            retained = []
+            for marker in self.detection_timeline_events:
+                if predicate(marker):
+                    self.plot.removeItem(marker["text_item"])
+                else:
+                    retained.append(marker)
+            self.detection_timeline_events = retained
 
         @staticmethod
         def event_epoch_time(detected_at: str) -> float:
@@ -1965,18 +2217,59 @@ def run_monitor(
             elif event.event_type == "activity_detected" and event.label == "static":
                 style = ("정지", "#b7bec8", "o", 0)
             elif event.event_type == "ml_fall_candidate":
-                style = ("ML 낙상 후보", "#4da3ff", "d", 5)
+                style = (
+                    f"ML 후보 {event.confidence * 100:.0f}%",
+                    "#4da3ff",
+                    "d",
+                    5,
+                )
             elif event.event_type == "radar_fall_candidate":
-                style = ("Radar 낙상 후보", "#ff9f43", "s", 6)
+                style = (
+                    f"Radar 후보 {event.confidence * 100:.0f}%",
+                    "#ff9f43",
+                    "s",
+                    6,
+                )
             elif event.event_type == "fall_suspected":
                 if event.source == "radar_high_confidence_fallback":
-                    style = ("Radar 보조 낙상", "#ff6f3c", "x", 7)
+                    style = ("Radar 보조 경보", "#ff6f3c", "x", 7)
                 else:
-                    style = ("최종 낙상", "#ff4d4f", "x", 8)
+                    style = (
+                        f"낙상 의심 {event.confidence * 100:.0f}%",
+                        "#ff4d4f",
+                        "x",
+                        8,
+                    )
             if style is None:
                 return
+            marker_at = self.event_epoch_time(event.detected_at)
+            if event.event_type == "fall_suspected":
+                # Candidate and final are often emitted in the same poll. Keep
+                # only the final decision for that physical event on the plot.
+                # Radar-backed finals can use a different event id from the ML
+                # episode, so also collapse nearby candidate markers.
+                self.remove_detection_timeline_markers(
+                    lambda marker: marker.get("event_id") == event.event_id
+                    or (
+                        marker.get("event_type")
+                        in {"ml_fall_candidate", "radar_fall_candidate"}
+                        and abs(
+                            float(marker.get("marker_at", 0.0)) - marker_at
+                        )
+                        < 6.0
+                    )
+                )
+            elif event.event_type in {"ml_fall_candidate", "radar_fall_candidate"}:
+                # Replace dense same-kind candidates inside six seconds with
+                # the latest one; the journal and replay clips remain lossless.
+                self.remove_detection_timeline_markers(
+                    lambda marker: marker.get("event_type") == event.event_type
+                    and abs(float(marker.get("marker_at", 0.0)) - marker_at) < 6.0
+                )
             self.add_detection_timeline_marker(
-                marker_at=self.event_epoch_time(event.detected_at),
+                marker_at=marker_at,
+                event_id=event.event_id,
+                event_type=event.event_type,
                 label=style[0],
                 color=style[1],
                 symbol=style[2],
@@ -1984,29 +2277,10 @@ def run_monitor(
             )
 
         def record_ml_timeline_transition(self, label: str) -> None:
-            if label == self.last_timeline_ml_label:
-                return
+            # Raw model argmax is shown in the status card only. Plotting every
+            # C3-domain class transition made the physical event timeline
+            # unreadable and looked like a final fall decision.
             self.last_timeline_ml_label = label
-            styles = {
-                "walking": ("ML 보행", "#70a7ff", "t", 2),
-                "other_motion": ("ML 기타 움직임", "#b388ff", "d", 3),
-                "fall_suspected": (
-                    "ML 낙상성 분류(중간)",
-                    "#ff6b6b",
-                    "p",
-                    4,
-                ),
-            }
-            style = styles.get(label)
-            if style is None:
-                return
-            self.add_detection_timeline_marker(
-                marker_at=datetime.now(timezone.utc).timestamp(),
-                label=style[0],
-                color=style[1],
-                symbol=style[2],
-                lane=style[3],
-            )
 
         def refresh_detection_timeline(self) -> None:
             if not self.radar_sample_times:
@@ -2109,6 +2383,18 @@ def run_monitor(
                 "device_id": "rx-s3-001",
                 "channel": self.current_channel,
             }
+            if event.event_type in {
+                "ml_fall_candidate",
+                "radar_fall_candidate",
+                "fall_suspected",
+            }:
+                clip_path = self.event_clip_recorder.trigger(
+                    record,
+                    observed_at=monotonic(),
+                )
+                record["event_clip_file"] = clip_path.relative_to(
+                    self.project_root
+                ).as_posix()
             self.event_journal.append(record)
             if event.event_type in FALL_HISTORY_EVENT_TYPES:
                 self.refresh_fall_history()
@@ -2137,9 +2423,9 @@ def run_monitor(
                 room_id=str(self.active_profile["roomId"]),
                 risk_score=event.confidence,
                 motion_confidence=event.confidence,
-                presence_state=str(evidence["presence_state"]),
-                presence_probability=float(evidence["presence_probability"]),
-                no_recovery_sec=float(evidence["no_recovery_sec"]),
+                presence_state=str(evidence.get("presence_state", "unknown")),
+                presence_probability=float(evidence.get("presence_probability", 0.0)),
+                no_recovery_sec=float(evidence.get("no_recovery_sec", 0.0)),
             )
             endpoint = self.fall_alert_endpoint.text().strip()
             if not endpoint:
@@ -2168,7 +2454,7 @@ def run_monitor(
                 color = "#b54708"
             else:
                 self.fusion_diagnostic_status.setText(
-                    "융합 진단: ML과 Radar 낙상 후보 대기 · Radar 단독 보조 알림 꺼짐"
+                    "융합 진단: 연속 ML·CSI/Radar soft fusion · Radar 단독 보조 알림 꺼짐"
                 )
                 color = "#495057"
             self.fusion_diagnostic_status.setStyleSheet(
@@ -2325,14 +2611,15 @@ def run_monitor(
                 self.fusion_candidate_kind = "ML"
                 self.fusion_candidate_at = now
                 self.fusion_diagnostic_status.setText(
-                    "융합 진단: ML 낙상 후보 감지 · 15초 안의 Radar 충격 후보 대기"
+                    "융합 진단: ML 낙상 후보 · Radar/CSI 점수는 선택 근거이며 "
+                    "없어도 고신뢰 ML은 판정 가능"
                 )
                 color = "#175cd3"
             elif event.event_type == "radar_fall_candidate":
                 self.fusion_candidate_kind = "Radar"
                 self.fusion_candidate_at = now
                 self.fusion_diagnostic_status.setText(
-                    "융합 진단: Radar 낙상 후보 감지 · 15초 안의 ML 후보 대기"
+                    "융합 진단: Radar 낙상 후보 · ML/CSI soft score와 상관 분석 중"
                 )
                 color = "#b54708"
             elif event.event_type == "fall_suspected":
@@ -2348,8 +2635,13 @@ def run_monitor(
                     color = "#c4320a"
                 else:
                     prefix = "안전 시뮬레이션 · " if simulation else ""
+                    components = event.evidence.get("fusion_components", {})
+                    final_score = float(
+                        event.evidence.get("final_fall_score", event.confidence)
+                    )
                     self.fusion_diagnostic_status.setText(
-                        f"융합 진단: {prefix}ML+Radar 결합 완료 · 앱 알림 전송 판단"
+                        f"융합 진단: {prefix}soft fusion {final_score * 100:.1f}% · "
+                        f"근거 {components} · hard AND 없음"
                     )
                     color = "#b42318"
             else:
@@ -2388,10 +2680,9 @@ def run_monitor(
                 return
             if now - self.fusion_candidate_at <= self.fusion_correlation_seconds:
                 return
-            missing = "Radar 충격" if self.fusion_candidate_kind == "ML" else "ML"
             self.fusion_diagnostic_status.setText(
-                f"융합 미완료: {self.fusion_candidate_kind} 후보만 감지 · "
-                f"15초 안에 {missing} 후보가 없어 알림하지 않음"
+                f"융합 후보 종료: {self.fusion_candidate_kind} 근거의 최종 score가 "
+                "현재 판정 기준 미만 · 누락 근거를 hard gate로 사용하지 않음"
             )
             self.fusion_diagnostic_status.setStyleSheet(
                 "background:#b54708;color:white;padding:8px;border-radius:5px;"
@@ -2477,6 +2768,7 @@ def run_monitor(
             self.scan_phase = "leaving"
             self.scan_deadline = monotonic() + 10
             self.scan_results.clear()
+            self.scan_csi_timing.clear()
             self.set_collection_controls_enabled(False)
             self.status.setText("통합 보정 준비 - 10초 안에 방을 비워 주세요")
             self.status.setStyleSheet(
@@ -2527,12 +2819,18 @@ def run_monitor(
                     gaps.append(now - self.scan_radar_times[-1])
                 else:
                     gaps = [15.0]
+                csi_stats = self.scan_csi_timing.get(
+                    channel, PacketTimingTracker()
+                ).stats()
                 self.scan_results[channel] = {
                     "samples": float(len(frequencies)),
                     "min_hz": float(min(frequencies)) if frequencies else 0.0,
                     "avg_hz": sum(frequencies) / len(frequencies) if frequencies else 0.0,
                     "avg_rssi": sum(rssis) / len(rssis) if rssis else -999.0,
                     "max_gap": max(gaps) if gaps else 15.0,
+                    "csi_rate_hz": csi_stats.rate_hz,
+                    "csi_p95_interval_ms": csi_stats.p95_interval_ms,
+                    "signal_quality": csi_stats.signal_quality_score,
                 }
                 self.scan_index += 1
                 if self.scan_index < len(self.scan_channels):
@@ -2623,6 +2921,7 @@ def run_monitor(
             update_profile_channel(
                 self.project_root, self.active_profile, selected_channel
             )
+            self.csi_pipeline.baseline.start_calibration()
             self.refresh_presence_baseline()
             self.refresh_profile_status()
             self.integrated_calibration = integrated
@@ -2717,20 +3016,28 @@ def run_monitor(
             if self.calibration_channel is not None:
                 self.active_profile["radio"]["channel"] = self.calibration_channel
             self.calibration_channel = None
+            csi_baseline_ready = self.csi_pipeline.baseline.finalize_calibration(
+                minimum_frames=200
+            )
             update_profile_calibration(
                 self.project_root,
                 self.active_profile,
                 someone_threshold=sample.someone_threshold,
                 move_threshold=sample.move_threshold,
+                csi_baseline=(
+                    self.csi_pipeline.baseline.to_record()
+                    if csi_baseline_ready
+                    else None
+                ),
             )
             self.refresh_presence_baseline()
             self.show_presence(self.presence_detector.reset("warming_up"))
             self.set_collection_controls_enabled(True)
             self.refresh_profile_status()
             self.status.setText(
-                "통합 보정 완료 - 프로필 저장됨"
+                "통합 보정 완료 - Radar/CSI baseline 저장됨"
                 if was_integrated
-                else "CALIBRATION COMPLETE - PROFILE SAVED"
+                else "CALIBRATION COMPLETE - RADAR/CSI BASELINE SAVED"
             )
             self.status.setStyleSheet(
                 "background:#175cd3;color:white;padding:18px;border-radius:8px;"
@@ -2765,6 +3072,16 @@ def run_monitor(
             self.last_sample_at = now
             self.last_link_at = self.last_sample_at
             self.current_moving = sample.moving
+            if (
+                self.activity_aggregator is not None
+                and not self.scanning_channels
+                and not self.calibrating
+                and not self.collecting
+            ):
+                self.activity_aggregator.observe_radar_motion(
+                    moving=sample.moving,
+                    observed_at=now,
+                )
             self.jitter_values.append(sample.jitter)
             self.threshold_values.append(sample.move_threshold)
             sample_epoch = datetime.now(timezone.utc).timestamp()
@@ -2868,11 +3185,23 @@ def run_monitor(
                 )
 
             elapsed = max(monotonic() - self.started_at, 0.001)
+            timing = self.csi_pipeline.timing.stats()
+            signal = self.latest_signal_evidence
+            signal_text = (
+                f"CSI state: {signal.state}  |  Motion: {signal.motion_score:.2f}  |  "
+                f"Impact: {signal.impact_score:.2f}  |  Quality: {signal.signal_quality_score:.2f}"
+                if signal is not None
+                else "CSI state: waiting"
+            )
             self.details.setText(
                 f"Port: {port}  |  Samples: {self.sample_count}  |  "
                 f"Rate: {self.sample_count / elapsed:.1f}/s  |  "
                 f"Jitter: {sample.jitter:.6f}  |  "
-                f"Threshold: {sample.move_threshold:.6f}"
+                f"Threshold: {sample.move_threshold:.6f}\n"
+                f"CSI: {timing.rate_hz:.1f} Hz  |  median {timing.median_interval_ms:.2f} ms  |  "
+                f"p95 {timing.p95_interval_ms:.2f} ms  |  max {timing.max_interval_ms:.2f} ms  |  "
+                f"gaps {timing.gap_count}  |  missing {timing.missing_sequence_count}\n"
+                f"{signal_text}"
             )
 
         def update_link(self, sample: LinkSample) -> None:
@@ -2886,8 +3215,110 @@ def run_monitor(
 
         def update_channel(self, sample: ChannelSample) -> None:
             self.current_channel = sample.channel
-            self.channel_status.setText(
-                f"Current Wi-Fi channel: {sample.channel}  |  Bandwidth: HT20"
+            self.reported_rx_channel = sample.channel
+            self.refresh_radio_status()
+
+        def observe_csi_radio(self, sample: CsiFrameSample) -> None:
+            """Remember radio values observed on a live CSI frame."""
+            previous = (
+                self.observed_csi_channel,
+                self.observed_bandwidth,
+                self.observed_cwb,
+                self.observed_secondary_channel,
+                self.observed_sig_mode,
+                self.observed_source_mac,
+            )
+            self.observed_csi_channel = sample.channel
+            self.observed_bandwidth = sample.bandwidth
+            self.observed_cwb = sample.cwb
+            self.observed_secondary_channel = sample.secondary_channel
+            self.observed_sig_mode = sample.sig_mode
+            self.observed_source_mac = sample.source_mac
+            current = (
+                self.observed_csi_channel,
+                self.observed_bandwidth,
+                self.observed_cwb,
+                self.observed_secondary_channel,
+                self.observed_sig_mode,
+                self.observed_source_mac,
+            )
+            if previous != current or self.channel_status.text().startswith(
+                "실제 RF: CSI 확인"
+            ):
+                self.refresh_radio_status()
+
+        def runtime_radio_issues(self, now: float | None = None) -> list[str]:
+            """Return reasons the effective TX/RX radio state is unverified."""
+            observed_at = monotonic() if now is None else now
+            if not self.last_csi_at or observed_at - self.last_csi_at > 2.0:
+                return [
+                    "최근 2초 안에 유효한 CSI 프레임이 없어 실제 RF 상태를 "
+                    "확인할 수 없음"
+                ]
+
+            issues: list[str] = []
+            if self.reported_rx_channel is None:
+                issues.append("RX의 RF_CHANNEL 응답을 받지 못함")
+            elif self.reported_rx_channel != self.observed_csi_channel:
+                issues.append(
+                    "RX 응답 채널 "
+                    f"{self.reported_rx_channel} ≠ CSI 채널 {self.observed_csi_channel}"
+                )
+
+            profile_channel = int(self.active_profile["radio"]["channel"])
+            if profile_channel != self.observed_csi_channel:
+                issues.append(
+                    f"공간 프로필 채널 {profile_channel} ≠ CSI 채널 "
+                    f"{self.observed_csi_channel}"
+                )
+            if self.observed_bandwidth != FIXED_WIFI_BANDWIDTH or self.observed_cwb != 0:
+                issues.append(
+                    f"실제 Bandwidth {self.observed_bandwidth or '확인 불가'} "
+                    f"(cwb={self.observed_cwb}) ≠ 고정값 {FIXED_WIFI_BANDWIDTH}"
+                )
+            if self.observed_secondary_channel != 0:
+                issues.append(
+                    "HT20이어야 하지만 "
+                    f"secondary_channel={self.observed_secondary_channel}"
+                )
+            return issues
+
+        def refresh_radio_status(self, now: float | None = None) -> None:
+            """Render only live-observed channel/bandwidth as the GUI RF state."""
+            observed_at = monotonic() if now is None else now
+            issues = self.runtime_radio_issues(observed_at)
+            if not self.last_csi_at or observed_at - self.last_csi_at > 2.0:
+                rx_text = (
+                    str(self.reported_rx_channel)
+                    if self.reported_rx_channel is not None
+                    else "응답 대기"
+                )
+                self.channel_status.setText(
+                    "실제 RF: CSI 확인 대기/중단 | "
+                    f"RX 응답 채널: {rx_text} | Bandwidth: 확인 불가"
+                )
+                self.channel_status.setStyleSheet(
+                    "background:#b54708;color:white;padding:10px;border-radius:6px;"
+                )
+                return
+
+            detail = (
+                f"CSI 채널 {self.observed_csi_channel} | "
+                f"Bandwidth {self.observed_bandwidth} (cwb={self.observed_cwb}) | "
+                f"RX 응답 {self.reported_rx_channel} | "
+                f"secondary {self.observed_secondary_channel} | "
+                f"CSI 송신 주소 {self.observed_source_mac}"
+            )
+            if issues:
+                self.channel_status.setText(
+                    "실제 RF 불일치: " + detail + "\n" + " · ".join(issues)
+                )
+                color = "#b42318"
+            else:
+                self.channel_status.setText("실제 RF 검증됨: " + detail)
+                color = "#087f3d"
+            self.channel_status.setStyleSheet(
+                f"background:{color};color:white;padding:10px;border-radius:6px;"
             )
 
         def show_link(self, sample: LinkSample) -> None:
@@ -2908,6 +3339,7 @@ def run_monitor(
         def update_health(self) -> None:
             now = monotonic()
             self.update_fusion_timeout(now)
+            self.refresh_radio_status(now)
             if self.calibrating or self.scanning_channels or self.collecting:
                 return
             self.show_presence(
@@ -2996,6 +3428,14 @@ def run_monitor(
             self.reader.wait(1000)
             if self.activity_engine is not None:
                 self.activity_engine.close()
+            baseline_record = self.csi_pipeline.baseline.to_record()
+            if baseline_record is not None:
+                update_profile_csi_baseline(
+                    self.project_root,
+                    self.active_profile,
+                    baseline_record,
+                )
+            self.event_clip_recorder.close()
             event.accept()
 
     app = QApplication(sys.argv)

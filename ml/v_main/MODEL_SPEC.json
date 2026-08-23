@@ -64,9 +64,17 @@
     "adapter": "ml.runtime.TorchCnnActivityModel",
     "default_inference_hz": 5,
     "window_frames": 950,
+    "continuous_inference": true,
     "motion_tail_seconds": 3.0,
-    "integration_fall_score_threshold": 0.8,
-    "alert_fusion_rule": "ml_and_radar_v1",
+    "fall_candidate_score_threshold": 0.1,
+    "soft_fusion_decision_threshold": 0.72,
+    "ml_direct_score_threshold": 0.85,
+    "alert_fusion_rule": "recall_first_soft_fusion_v3",
+    "radar_and_stillness_are_optional_evidence": true,
+    "csi_or_radar_event_proposal_required_for_uncalibrated_c3_model": true,
+    "signal_proposal_min_baseline_age_at_start_seconds": 3.0,
+    "signal_proposal_consumed_once": true,
+    "final_refractory_seconds": 30.0,
     "device": "CUDA, then MPS, then CPU with MPS-to-CPU runtime fallback"
   },
   "limitations": [
@@ -74,6 +82,8 @@
     "Matching HT20 and the 52-bin input shape removes a configuration mismatch but does not guarantee improved accuracy.",
     "The selected checkpoint is a cross-validation fold checkpoint, not a full-data refit.",
     "Environment-grouped validation and a locked local ESP32-S3 test are still required.",
-    "Scores are model softmax probabilities and are not calibrated safety probabilities."
+    "Scores are model softmax probabilities and are not calibrated safety probabilities.",
+    "The checkpoint remains an auxiliary C3-domain model until enough labeled S3 IQ exists to train and lock a replacement.",
+    "The recall-first fusion recovered 2/2 known S3 falls with 0/1 empty-room false positives, but this tiny development replay is not generalization evidence."
   ]
 }

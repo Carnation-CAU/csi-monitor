@@ -9,7 +9,7 @@ from typing import Any
 from uuid import uuid4
 from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 
-from .collection import COLLECTION_LABELS
+from .collection import is_valid_collection_label
 from .profiles import load_profile, save_profile, utc_now
 
 
@@ -96,7 +96,7 @@ def export_profile_dataset(
         if manifest.get("profileId") != profile_id or manifest.get("valid") is False:
             continue
         label = str(manifest.get("label", ""))
-        if label not in COLLECTION_LABELS:
+        if not is_valid_collection_label(label) or label == "unlabeled":
             continue
         raw_file = manifest.get("rawFile")
         session_id = str(manifest.get("sessionId", "")).strip()
@@ -193,7 +193,11 @@ def import_dataset_bundle(project_root: Path, bundle_path: Path) -> dict[str, An
                 label = str(session.get("label", ""))
                 raw_member = str(session.get("rawPath", ""))
                 manifest_member = str(session.get("manifestPath", ""))
-                if not session_id or label not in COLLECTION_LABELS:
+                if (
+                    not session_id
+                    or not is_valid_collection_label(label)
+                    or label == "unlabeled"
+                ):
                     raise DatasetError("세션 ID 또는 행동 라벨이 올바르지 않습니다.")
                 _validate_member_name(raw_member)
                 _validate_member_name(manifest_member)

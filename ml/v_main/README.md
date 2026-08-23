@@ -47,8 +47,10 @@ CSI_DATA 문자열
 사용하지 않는다. 원본 문자열은 수집 JSONL에 그대로 보존되고 모델에는 amplitude만
 전달된다.
 
-현재 HT20 LLTF 펌웨어는 한 프레임을 104개 I/Q 정수, 즉 52개 amplitude로 만들어
-모델 입력 shape와 직접 맞는다. 이전 HT40 설정보다 검증 조건을 명확하게 맞추지만,
+현재 parser는 104개 값을 ESP-IDF 순서인 imaginary/real complex pair로 보존하고
+52개 amplitude·phase를 파생한다. 현재 C3 checkpoint에는 호환성을 위해 amplitude만
+전달하지만 S3 학습 pipeline은 IQ에서 상대 amplitude, Δ/Δ²와 phase variation을 다시 만든다.
+HT20 LLTF 입력 shape를 맞추는 것은 configuration mismatch만 줄일 뿐,
 이것만으로 정확도 향상을 보장하지는 않는다. 모델 학습 데이터는 ESP32-C3 기반이고
 실제 입력은 ESP32-S3이며 공간·배치·안테나·채널 차이도 남아 있으므로, 같은 HT20
 설정의 자체 S3 데이터로 locked test를 해야 실제 정확도를 판단할 수 있다.
@@ -73,8 +75,8 @@ macOS:
 - `COM7`은 실제 ESP32 수신기 포트로 바꾼다.
 - 두 실행 스크립트 모두 기본 `ml/v_main/model.pt`를 사용한다.
 - inference 빈도는 기본 5Hz이며 실제 latency와 연속 오탐을 측정해 조정한다.
-- gateway는 최근 950프레임이 쌓이고 `moving=true`일 때 background worker로
-  모델을 호출하며, 움직임 종료 후 3초까지 tail window를 판단한다.
+- gateway는 최근 950프레임이 쌓이면 Radar `moving`과 무관하게 background worker로
+  연속 추론한다. `moving`과 tail은 진단 호환 정보일 뿐 ML hard gate가 아니다.
 - checkpoint의 입력 크기를 직접 읽으므로 실행 인자로 950을 다시 지정하지 않는다.
 - 모델이 정상 로드되면 gateway가 RX에 LLTF decimal 원시 CSI 출력을 자동으로
   요청한다. 펌웨어 명령 인자의 철자만 `LLFT`다. 공식 GUI에서 raw display를
@@ -86,15 +88,21 @@ macOS:
 
 ## 낙상 후보와 알림
 
-겹치는 950프레임 window에서 같은 낙상이 여러 번 출력돼도 물리적 행동은 한
-번이다. 0.8 이상의 `fall_suspected` score가 2초 이내에 이어지는 window들을 한
-ML 행동 사건으로 묶는다. 이 0.8은 공개 C3 모델의 초기 시스템 통합 기준이지
-검증된 안전 확률이 아니다.
+겹치는 950프레임 window의 raw `fall_suspected` score 0.10 이상을 2초 episode로
+묶는다. Radar fall, CSI motion/impact와 post-event score는 15초 구간의 event
+proposal이다. `recall_first_soft_fusion_v3`는 이 score를 결합해 0.72 이상이면 최종
+낙상 의심을 만든다. 아직 미보정 C3 모델이므로 raw ML 0.85 이상이어도 CSI 또는
+Radar event proposal 한 개는 필요하지만, Radar 자체나 낙상 후 정지는 필수가 아니다.
+CSI motion/impact/post-event를 0.30/0.45/0.25로 묶은 제안과 Radar fall/motion 제안 중
+가장 강한 사건 근거를 사용하므로 선택적인 약한 센서가 강한 근거를 희석하지 않는다.
+기준선 준비 또는 채널 변경 직후 3초 안에 시작한 CSI proposal은 startup transient로
+격리한다.
+한 CSI proposal은 한 번만 사용하고 연속 최종 판정은 30초 동안 같은 사건으로 병합한다.
 
-ML 행동 사건만으로는 앱 알림을 보내지 않는다. 기존 Radar가 충격 후 8초간
-회복 움직임이 없다고 판정하고, 그 시점에서 최근 15초 안에 ML 낙상 사건이 있을
-때만 `ml_and_radar_v1` 최종 낙상 의심 이벤트 한 건을 만든다. 한쪽 근거만 있으면
-`ml_fall_candidate` 또는 `radar_fall_candidate`로 기록만 한다.
+0.10/0.72/0.85는 두 S3 낙상 FN을 분석해 만든 개발 통합값이며 안전 확률이 아니다.
+동일 로컬 replay에서는 기존 0/2에서 2/2로 복구했지만, 낙상 2건과 빈 방 1건뿐이라
+일반 성능으로 보고할 수 없다. 새 S3 grouped validation의 PR curve로 재선택해야 한다.
+상세 근거와 명령은 `docs/s3-recall-first-architecture.md`에 기록한다.
 
 ## Python에서 직접 호출
 

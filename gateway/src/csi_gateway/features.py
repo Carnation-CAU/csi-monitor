@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from statistics import fmean, pstdev
 
-from .collection import COLLECTION_LABELS
+from .collection import UNLABELED, is_valid_collection_label
 from .datasets import dataset_path, load_dataset
 from .profiles import load_profile
 from .radar import LinkSample, RadarSample, parse_link_line, parse_radar_line
@@ -90,7 +90,12 @@ def build_dataset_feature_rows(
     rows: list[dict[str, str | float | bool]] = []
     for session in dataset.get("sessions", []):
         raw_path = root / str(session["rawPath"])
-        if not raw_path.is_file() or session.get("label") not in COLLECTION_LABELS:
+        label = session.get("label")
+        if (
+            not raw_path.is_file()
+            or not is_valid_collection_label(label)
+            or label == UNLABELED
+        ):
             continue
         rows.append(
             {
@@ -114,7 +119,10 @@ def build_profile_feature_rows(
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if manifest.get("profileId") != profile_id or manifest.get("valid") is False:
             continue
-        if manifest.get("label") not in COLLECTION_LABELS:
+        if (
+            not is_valid_collection_label(manifest.get("label"))
+            or manifest.get("label") == UNLABELED
+        ):
             continue
         raw_file = manifest.get("rawFile")
         if not raw_file:

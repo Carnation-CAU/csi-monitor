@@ -53,7 +53,10 @@ class ChannelCalibrationTests(unittest.TestCase):
 
         self.assertEqual(
             rows,
-            ["CH 1: avg 62.2 Hz, min 48 Hz, RSSI -67.5 dBm, max gap 1.2s"],
+            [
+                "CH 1: avg 62.2 Hz, min 48 Hz, RSSI -67.5 dBm, max gap 1.2s, "
+                "CSI 0.0Hz/quality 0.00"
+            ],
         )
 
 
